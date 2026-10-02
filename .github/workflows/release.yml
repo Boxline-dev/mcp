@@ -15,10 +15,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
+          package-manager-cache: false # nothing installed from a cache: the copy installs nothing, a release starts clean
           registry-url: https://registry.npmjs.org
       - name: npm 11.5 or newer (trusted publishing)
         run: npm install -g npm@latest
