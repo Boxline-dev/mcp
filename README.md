@@ -1,6 +1,8 @@
 # Boxline MCP server
 
-Gives any MCP client (Claude, Cursor, VS Code and others) an isolated cloud machine with a real browser, a shell and
+**Give your AI agents the infrastructure they need: browsers, shells, storage and isolated machines.**
+
+This server gives any MCP client (Claude, Cursor, VS Code and others) an isolated cloud machine with a real browser, a shell and
 a disk, through [Boxline](https://boxline.dev). The agent can open pages, click and type, read a page as Markdown,
 run commands, read and write files, fetch pages and search the web.
 
