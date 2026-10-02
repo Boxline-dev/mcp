@@ -1,0 +1,43 @@
+# Publishes this package to npm when a release is published here on GitHub (tag v<version>), with npm's trusted
+# publishing: no token, npm trusts this repository's workflow, and the package gets a provenance statement.
+# A version that is already on npm (the first versions were published by hand) is left as it is.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm 11.5 or newer (trusted publishing)
+        run: npm install -g npm@latest
+      - name: The tag must be the package's version
+        id: version
+        run: |
+          name="$(node -p 'require("./package.json").name')"
+          version="$(node -p 'require("./package.json").version')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the release tag $GITHUB_REF_NAME is not v$version (package.json)"
+            exit 1
+          fi
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "::notice::$name@$version is already on npm"
+            echo "published=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.version.outputs.published != 'yes'
+        run: npm install --no-audit --no-fund
+      - if: steps.version.outputs.published != 'yes'
+        run: npm run build
+      - if: steps.version.outputs.published != 'yes'
+        run: npm publish --provenance --access public
