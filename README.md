@@ -39,12 +39,35 @@ and, when the plan has them, a shell), so an agent can call `browser_navigate` a
 
 | Group | Tools |
 |---|---|
-| Sessions | `session_create`, `session_close` (stops billing), `session_move` (to a fresh machine, keeping tabs, logins and files) |
-| Browser | `browser_navigate`, `browser_click`, `browser_type`, `browser_press`, `browser_read` (Markdown or text), `browser_screenshot` |
+| Sessions | `session_create` (optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_close` (stops billing), `session_move` (to a fresh machine, keeping tabs, logins and files) |
+| Browser | `browser_navigate`, `browser_click`, `browser_type` (text, or a saved credential), `browser_press`, `browser_read` (Markdown or text), `browser_screenshot` |
+| Credentials | `credentials_list` (names, types and sites of the saved passwords and secrets, never their values) |
 | Mouse and keyboard | `mouse_move`, `mouse_click`, `mouse_drag`, `hover`, `key`, `computer` (screenshot-driven computer use) |
 | Shell and code | `run_command` (bash in the session), `run_playwright` (Playwright code next to the browser) |
 | Files | `list_files`, `read_file`, `write_file` (the session's workspace) |
 | Web | `fetch_url` (a page through a real browser, no session needed), `web_search` (with the top pages as Markdown) |
+
+### Signing in without showing the agent a password
+
+Save a website password (or a secret) as a **credential** in the Boxline console, the [CLI](https://www.npmjs.com/package/@boxline/cli) or an SDK.
+The agent calls `credentials_list` to see what exists (names, types and the sites each may be typed on; never a value), then
+types it with `browser_type`:
+
+```
+browser_type { "credential": "SHOP", "field": "username", "selector": "#email" }
+browser_type { "credential": "SHOP", "field": "password", "selector": "#password" }
+browser_type { "credential": "SHOP", "field": "otp", "selector": "#code" }   // the current 2FA code, if the password has a 2FA key
+```
+
+The platform types the value into the field itself, only on the sites the credential was saved for, and never shows it to
+the agent, the chat or the logs: wherever a result would show it (`browser_read`, the page's elements, a screenshot, an
+error), the text is replaced by `%SHOP.password%` and the field is covered. **This hides a value; it does not protect
+it.** It is a guard against showing a credential by accident, not a boundary: code that runs in the page or the session
+(`run_playwright`, a command in `run_command`) can still read a field and print it, for example reversed or in base64. Use a
+password only in sessions whose pages and scripts you trust, and save it with the narrowest sites. `session_create` can also start from a saved browser `profile` (cookies and logins from an
+earlier sign-in; `persistProfile` saves new ones back) and export `credentials` into the session's shell as environment
+variables, for those credentials that allow it. No tool creates or changes a credential, so a password never passes
+through the chat: add them yourself, outside the conversation.
 
 Sessions are billed while they run: close them with `session_close` when the work is done, or let them end at their
 time limit.

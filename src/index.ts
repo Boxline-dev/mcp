@@ -13,7 +13,7 @@ import { Boxline, BoxlineError, type Session } from "@boxline/sdk";
 import { z } from "zod";
 
 const client = new Boxline();
-const server = new McpServer({ name: "boxline", version: "0.1.0" });
+const server = new McpServer({ name: "boxline", version: "0.2.0" });
 
 let current: Session | null = null;
 const TEXT_LIMIT = 40_000;
@@ -73,7 +73,10 @@ tool(
   "session_create",
   "Create a new isolated session (Chrome browser + optional bash shell + shared /workspace disk) and make it the default. " +
     "Optionally browse through a proxy: proxyType residential (home IPs) or datacenter, with proxyCountry (two letters) and, for residential, proxyCity. " +
-    "blockAds: refuse ad and tracker sites (faster, less clutter). cookieBanners: \"reject\" (default) answers cookie consent banners with Reject all, \"off\" leaves them.",
+    "blockAds: refuse ad and tracker sites (faster, less clutter). cookieBanners: \"reject\" (default) answers cookie consent banners with Reject all, \"off\" leaves them. " +
+    "profile: the id of a saved browser profile to start from (its cookies and logins); persistProfile saves what the session signs in to back into it when it ends. " +
+    "credentials: names of saved credentials (see credentials_list) to export into the shell as environment variables, only those whose scope allows the shell; needs a shell. " +
+    "To sign in on a page, do not export anything: use browser_type with a credential.",
   {
     shell: z.boolean().optional(),
     timeout: z.number().optional(),
@@ -82,6 +85,9 @@ tool(
     proxyCity: z.string().optional(),
     blockAds: z.boolean().optional(),
     cookieBanners: z.enum(["reject", "off"]).optional(),
+    profile: z.string().optional().describe("Id of a saved browser profile to start from"),
+    persistProfile: z.boolean().optional().describe("Save the session's logins back into the profile when it ends"),
+    credentials: z.array(z.string()).max(50).optional().describe("Names of saved credentials to export into the shell (needs a shell)"),
   },
   async (a) => {
     const proxy = a.proxyType
@@ -90,7 +96,10 @@ tool(
         : { type: "datacenter" as const, country: a.proxyCountry }
       : undefined;
     const settings: BrowserSettings = { blockAds: a.blockAds, cookieBanners: a.cookieBanners };
-    const params = { browser: true, shell: a.shell ?? true, timeout: a.timeout ?? (await defaultTimeout()), proxy, ...settings };
+    if (a.persistProfile && !a.profile) throw new Error("persistProfile needs a profile id");
+    const profile = a.profile ? { id: a.profile, persist: a.persistProfile ?? false } : undefined;
+    const credentials = a.credentials?.length ? a.credentials : undefined;
+    const params = { browser: true, shell: a.shell ?? true, timeout: a.timeout ?? (await defaultTimeout()), proxy, profile, credentials, ...settings };
     current = await client.sessions.create(params);
     return text(JSON.stringify({ sessionId: current.id, liveUrl: current.liveUrl, workspace: current.workspacePath }, null, 2));
   },
@@ -108,6 +117,34 @@ tool("session_move", "Move the session to a fresh machine, keeping tabs, logins,
   return text(`Moved in ${(await s.move()).totalMs} ms.`);
 });
 
+/**
+ * GET /v1/credentials, shown without anything but what the model needs to choose one: names, types, sites, where each
+ * may be used and which parts of a password browser_type can type. The API never returns a value; this adds none. There
+ * is deliberately no tool that creates or changes a credential: that would send passwords through the chat.
+ */
+tool(
+  "credentials_list",
+  "List the project's saved credentials (passwords and secrets): name, type, the sites each may be typed on, and for a password which fields browser_type can type. " +
+    "Never shows a value. Use a name with browser_type's credential, or in session_create's credentials. Credentials are added by the user in the Boxline console, the CLI or an SDK, not here.",
+  {},
+  async () => {
+    const rows: { name: string; type: string; sites: string[] | "any"; scope: string; fields?: string[]; browserType: boolean }[] = [];
+    for await (const c of client.credentials.list({ limit: 200 })) {
+      rows.push({
+        name: c.name,
+        type: c.type,
+        sites: c.origins?.length ? c.origins : "any",
+        scope: c.scope,
+        ...(c.type === "password" ? { fields: ["username", "password", ...(c.hasTotp ? ["otp"] : [])] } : {}),
+        // Scope "shell" is not for the AI: browser_type would be refused.
+        browserType: c.scope !== "shell",
+      });
+    }
+    if (!rows.length) return text("No credentials saved. Ask the user to add one in the Boxline console.");
+    return text(JSON.stringify(rows, null, 2));
+  },
+);
+
 tool("browser_navigate", "Open a URL in the session's browser.", { sessionId, url: z.string() }, async (a) => {
   const v = await (await session(a.sessionId)).goto(a.url);
   return text(`Loaded ${v.url} (HTTP ${v.status ?? "?"}) — ${v.title}`);
@@ -123,10 +160,30 @@ tool(
   },
 );
 
-tool("browser_type", "Type text, optionally into the element matched by selector.", { sessionId, text: z.string(), selector: z.string().optional() }, async (a) => {
-  const [r] = await (await session(a.sessionId)).actions({ action: "type", text: a.text, selector: a.selector });
-  return r?.ok ? text("Typed.") : fail(r?.error);
-});
+tool(
+  "browser_type",
+  "Type text, optionally into the element matched by selector. To type a saved password or secret, give credential (a name from credentials_list) instead of text: " +
+    "the platform types it without you seeing it. For a password also give field: username, password or otp (the current 2FA code, when credentials_list says it has 2FA). " +
+    "A password goes only into the field selector names, and only on the sites it was saved for. Never ask the user to paste a password into the chat.",
+  {
+    sessionId,
+    text: z.string().optional(),
+    selector: z.string().optional(),
+    credential: z.string().optional().describe("Name of a saved credential (credentials_list) to type instead of text"),
+    field: z.enum(["username", "password", "otp"]).optional().describe("Which part of a password credential to type"),
+  },
+  async (a) => {
+    if (a.credential !== undefined && a.text !== undefined) return fail("give text or credential, not both");
+    if (a.credential === undefined && a.text === undefined) return fail("give the text to type, or a credential to type");
+    if (a.credential === undefined && a.field !== undefined) return fail("field is only for credential");
+    const s = await session(a.sessionId);
+    const [r] = await s.actions(
+      a.credential !== undefined ? { action: "type", credential: a.credential, field: a.field, selector: a.selector } : { action: "type", text: a.text!, selector: a.selector },
+    );
+    if (r?.ok) return text(a.credential !== undefined ? (r.text ?? `Typed ${a.credential}.`) : "Typed.");
+    return fail(r?.code ? `${r.code}: ${r.error ?? "the action failed"}` : r?.error);
+  },
+);
 
 tool("browser_press", "Press a key, e.g. Enter or Control+A.", { sessionId, key: z.string() }, async (a) => {
   const [r] = await (await session(a.sessionId)).actions({ action: "press", key: a.key });
