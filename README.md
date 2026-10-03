@@ -40,8 +40,8 @@ and, when the plan has them, a shell), so an agent can call `browser_navigate` a
 | Group | Tools |
 |---|---|
 | Sessions | `session_create` (optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_close` (stops billing), `session_move` (to a fresh machine, keeping tabs, logins and files) |
-| Browser | `browser_navigate`, `browser_click`, `browser_type` (text, or a saved credential), `browser_press`, `browser_read` (Markdown or text), `browser_screenshot` |
-| Credentials | `credentials_list` (names, types and sites of the saved passwords and secrets, never their values) |
+| Browser | `browser_navigate`, `browser_click`, `browser_type` (text, or a saved credential), `browser_login` (sign in with a saved password), `browser_press`, `browser_read` (Markdown or text), `browser_screenshot` |
+| Credentials | `credentials_list` (names, types, sites and a password's code source for the saved passwords and secrets, never their values) |
 | Mouse and keyboard | `mouse_move`, `mouse_click`, `mouse_drag`, `hover`, `key`, `computer` (screenshot-driven computer use) |
 | Shell and code | `run_command` (bash in the session), `run_playwright` (Playwright code next to the browser) |
 | Files | `list_files`, `read_file`, `write_file` (the session's workspace) |
@@ -58,6 +58,12 @@ browser_type { "credential": "SHOP", "field": "username", "selector": "#email" }
 browser_type { "credential": "SHOP", "field": "password", "selector": "#password" }
 browser_type { "credential": "SHOP", "field": "otp", "selector": "#code" }   // the current 2FA code, if the password has a 2FA key
 ```
+
+Or sign in in one call with `browser_login { "credential": "SHOP", "url": "https://shop.example.com/login" }`: a short run in the
+session types the credential on its sites only, and the agent sees neither the password nor any code. A password whose
+`codeSource` (in `credentials_list`) is `push` or `url` waits for the code or sign-in link that your system sends, up to its
+timeout (the agent should tell you a code is needed); you send it with the CLI (`boxline credentials push-code SHOP`) or
+an SDK (`credentials.pushCode`), never through the chat.
 
 The platform types the value into the field itself, only on the sites the credential was saved for, and never shows it to
 the agent, the chat or the logs: wherever a result would show it (`browser_read`, the page's elements, a screenshot, an

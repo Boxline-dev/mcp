@@ -2,6 +2,22 @@
 
 All notable changes to `@boxline/mcp`.
 
+## 0.3.0 (2026-10-03)
+
+Built on the Node SDK 1.3 (`@boxline/sdk` `^1.3.0`).
+
+### Added
+
+- **`browser_login {credential, url?}`**: signs the session's browser in with a saved password credential in one call.
+  A short run in the session types the credential on its own sites only; the model never sees the password, a 2FA code
+  or a sign-in link. `url` is the sign-in page (one of the credential's sites). A credential whose code source is
+  `push` or `url` waits, up to its timeout, for the code or link the user's system sends. A login that takes too long
+  (15 steps, plus that timeout) is stopped and the tool answers `credential_login_timeout`; the page it returns is only
+  an origin when it is the page a sign-in link opened.
+- **`credentials_list` shows each password's `codeSource`** (`totp`, `push`, `url`, or null for no 2FA); `otp` is among
+  its `fields` when it has one. Never a value, the address a `url` source asks, or its signing secret.
+- `browser_type` with `field: "otp"` waits for a fresh code when the credential's source is `push` or `url`.
+
 ## 0.2.0 (2026-10-03)
 
 Built on the Node SDK 1.2 (`@boxline/sdk` `^1.2.0`).

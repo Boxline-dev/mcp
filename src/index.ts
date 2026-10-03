@@ -9,11 +9,11 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Boxline, BoxlineError, type Session } from "@boxline/sdk";
+import { Boxline, BoxlineError, CredentialLoginFailedError, type Session } from "@boxline/sdk";
 import { z } from "zod";
 
 const client = new Boxline();
-const server = new McpServer({ name: "boxline", version: "0.2.0" });
+const server = new McpServer({ name: "boxline", version: "0.3.0" });
 
 let current: Session | null = null;
 const TEXT_LIMIT = 40_000;
@@ -119,29 +119,54 @@ tool("session_move", "Move the session to a fresh machine, keeping tabs, logins,
 
 /**
  * GET /v1/credentials, shown without anything but what the model needs to choose one: names, types, sites, where each
- * may be used and which parts of a password browser_type can type. The API never returns a value; this adds none. There
- * is deliberately no tool that creates or changes a credential: that would send passwords through the chat.
+ * may be used, which parts of a password browser_type can type and where its 2FA codes come from. The API never returns
+ * a value; this adds none (nor the address a code source "url" asks, nor its signing secret). There is deliberately no
+ * tool that creates or changes a credential: that would send passwords through the chat.
  */
 tool(
   "credentials_list",
-  "List the project's saved credentials (passwords and secrets): name, type, the sites each may be typed on, and for a password which fields browser_type can type. " +
-    "Never shows a value. Use a name with browser_type's credential, or in session_create's credentials. Credentials are added by the user in the Boxline console, the CLI or an SDK, not here.",
+  "List the project's saved credentials (passwords and secrets): name, type, the sites each may be typed on, and for a password which fields browser_type can type and where its 2FA codes come from (codeSource: totp, push, url, or null for no 2FA). " +
+    "Never shows a value. Use a name with browser_type's credential, in browser_login, or in session_create's credentials. Credentials are added by the user in the Boxline console, the CLI or an SDK, not here.",
   {},
   async () => {
-    const rows: { name: string; type: string; sites: string[] | "any"; scope: string; fields?: string[]; browserType: boolean }[] = [];
+    const rows: { name: string; type: string; sites: string[] | "any"; scope: string; fields?: string[]; codeSource?: string | null; browserType: boolean }[] = [];
     for await (const c of client.credentials.list({ limit: 200 })) {
+      const codeSource = c.type === "password" ? (c.codeSource ?? (c.hasTotp ? "totp" : null)) : null;
       rows.push({
         name: c.name,
         type: c.type,
         sites: c.origins?.length ? c.origins : "any",
         scope: c.scope,
-        ...(c.type === "password" ? { fields: ["username", "password", ...(c.hasTotp ? ["otp"] : [])] } : {}),
+        ...(c.type === "password" ? { fields: ["username", "password", ...(codeSource ? ["otp"] : [])], codeSource } : {}),
         // Scope "shell" is not for the AI: browser_type would be refused.
         browserType: c.scope !== "shell",
       });
     }
     if (!rows.length) return text("No credentials saved. Ask the user to add one in the Boxline console.");
     return text(JSON.stringify(rows, null, 2));
+  },
+);
+
+tool(
+  "browser_login",
+  "Sign the session's browser in with a saved password credential (a name from credentials_list), in one call: a short run in the session types the credential on its own sites only, " +
+    "and you never see the password or any 2FA code or sign-in link. Give url to start from the site's sign-in page (it must be one of the credential's sites; default: the first). " +
+    "A credential whose codeSource is push or url waits for the code or link the user's system sends, up to its timeout: the call can take a few minutes, so tell the user a code is needed. " +
+    "Returns the page it ends on. Needs a session with a browser.",
+  {
+    sessionId,
+    credential: z.string().describe("Name of a saved password credential (credentials_list)"),
+    url: z.string().optional().describe("The sign-in page, on one of the credential's sites"),
+  },
+  async (a) => {
+    const s = await session(a.sessionId);
+    try {
+      const v = await s.login(a.credential, a.url !== undefined ? { url: a.url } : {});
+      return text(`Signed in with ${a.credential}: ${v.title || "(no title)"} (${v.url}).`);
+    } catch (err) {
+      if (err instanceof CredentialLoginFailedError) return fail(`${err.code}: ${err.message}${err.runId ? ` (run ${err.runId})` : ""}`);
+      throw err;
+    }
   },
 );
 
@@ -163,7 +188,7 @@ tool(
 tool(
   "browser_type",
   "Type text, optionally into the element matched by selector. To type a saved password or secret, give credential (a name from credentials_list) instead of text: " +
-    "the platform types it without you seeing it. For a password also give field: username, password or otp (the current 2FA code, when credentials_list says it has 2FA). " +
+    "the platform types it without you seeing it. For a password also give field: username, password or otp (the current 2FA code, when credentials_list says it has 2FA; with codeSource push or url it waits for the code the user's system sends). " +
     "A password goes only into the field selector names, and only on the sites it was saved for. Never ask the user to paste a password into the chat.",
   {
     sessionId,
