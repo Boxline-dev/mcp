@@ -13,7 +13,7 @@ import { Boxline, BoxlineError, CredentialLoginFailedError, type Session } from 
 import { z } from "zod";
 
 const client = new Boxline();
-const server = new McpServer({ name: "boxline", version: "0.3.0" });
+const server = new McpServer({ name: "boxline", version: "1.0.0" });
 
 let current: Session | null = null;
 const TEXT_LIMIT = 40_000;
@@ -32,7 +32,15 @@ async function session(id?: string): Promise<Session> {
   if (id) return client.sessions.get(id);
   if (current) {
     await current.refresh().catch(() => undefined);
-    if (current.status === "RUNNING" || current.status === "PAUSED") return current;
+    if (current.status === "RUNNING") return current;
+    // The default session stopped (its time ran out, say): bring it back as it was; a new one when that cannot be done.
+    if (current.status === "STOPPED") {
+      try {
+        return await current.resume();
+      } catch {
+        /* nothing saved, or no room to run it: start a new one below */
+      }
+    }
   }
   const timeout = await defaultTimeout();
   try {
@@ -86,7 +94,7 @@ tool(
     blockAds: z.boolean().optional(),
     cookieBanners: z.enum(["reject", "off"]).optional(),
     profile: z.string().optional().describe("Id of a saved browser profile to start from"),
-    persistProfile: z.boolean().optional().describe("Save the session's logins back into the profile when it ends"),
+    persistProfile: z.boolean().optional().describe("Save the session's logins back into the profile when it stops"),
     credentials: z.array(z.string()).max(50).optional().describe("Names of saved credentials to export into the shell (needs a shell)"),
   },
   async (a) => {
@@ -105,12 +113,37 @@ tool(
   },
 );
 
-tool("session_close", "Release a session (stops billing).", { sessionId }, async (a) => {
-  const s = await session(a.sessionId);
-  await s.release();
-  if (current?.id === s.id) current = null;
-  return text(`Session ${s.id} released.`);
+tool(
+  "session_stop",
+  "Stop a session: it is saved exactly as it is (every tab, the files) and billing stops. Resume it later with session_resume; it is kept for the plan's retention days, then deleted.",
+  { sessionId },
+  async (a) => {
+    // The session asked for, else the current one: never one resumed only to be stopped again.
+    const s = a.sessionId ? await client.sessions.get(a.sessionId) : current;
+    if (!s) return text("There is no current session to stop.");
+    await s.stop();
+    return text(`Session ${s.id} stopped. It is kept until ${s.data.deletesAt ?? "its retention days pass"}; session_resume brings it back.`);
+  },
+);
+
+tool("session_resume", "Resume a stopped session on a fresh machine, as it was when it stopped (same id, tabs and files).", { sessionId: z.string().describe("Id of the stopped session") }, async (a) => {
+  const s = await client.sessions.get(a.sessionId);
+  await s.resume();
+  current = s;
+  return text(JSON.stringify({ sessionId: s.id, liveUrl: s.liveUrl, workspace: s.workspacePath }, null, 2));
 });
+
+tool(
+  "session_delete",
+  "Delete a session for good: what it saved, its recording and its logs are deleted now. This cannot be undone; use session_stop to keep it.",
+  { sessionId: z.string().describe("Id of the session to delete") },
+  async (a) => {
+    const s = await client.sessions.get(a.sessionId);
+    await s.delete();
+    if (current?.id === s.id) current = null;
+    return text(`Session ${s.id} deleted.`);
+  },
+);
 
 tool("session_move", "Move the session to a fresh machine, keeping tabs, logins, form values and files.", { sessionId }, async (a) => {
   const s = await session(a.sessionId);

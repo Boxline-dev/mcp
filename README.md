@@ -39,7 +39,7 @@ and, when the plan has them, a shell), so an agent can call `browser_navigate` a
 
 | Group | Tools |
 |---|---|
-| Sessions | `session_create` (optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_close` (stops billing), `session_move` (to a fresh machine, keeping tabs, logins and files) |
+| Sessions | `session_create` (optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_stop` (saves the session as it is and stops billing), `session_resume` (brings a stopped session back as it was), `session_delete` (deletes it and what it saved, for good), `session_move` (to a fresh machine, keeping tabs, logins and files) |
 | Browser | `browser_navigate`, `browser_click`, `browser_type` (text, or a saved credential), `browser_login` (sign in with a saved password), `browser_press`, `browser_read` (Markdown or text), `browser_screenshot` |
 | Credentials | `credentials_list` (names, types, sites and a password's code source for the saved passwords and secrets, never their values) |
 | Mouse and keyboard | `mouse_move`, `mouse_click`, `mouse_drag`, `hover`, `key`, `computer` (screenshot-driven computer use) |
@@ -75,8 +75,10 @@ earlier sign-in; `persistProfile` saves new ones back) and export `credentials` 
 variables, for those credentials that allow it. No tool creates or changes a credential, so a password never passes
 through the chat: add them yourself, outside the conversation.
 
-Sessions are billed while they run: close them with `session_close` when the work is done, or let them end at their
-time limit.
+Sessions are billed while they run: stop them with `session_stop` when the work is done, or let them stop at their time
+limit. A stopped session is free and is kept for your plan's retention days (7 on Free, 30 on Hobby and Startup, 90 on
+Scale): `session_resume` brings it back with its tabs and files, and `session_delete` removes it at once, with its
+recording and logs. The default session is resumed by the server when it has stopped.
 
 ## Links
 

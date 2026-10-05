@@ -2,6 +2,18 @@
 
 All notable changes to `@boxline/mcp`.
 
+## 1.0.0 (2026-10-05)
+
+Built on the Node SDK 2.0 (`@boxline/sdk` `^2.0.0`).
+
+### Breaking
+
+- **`session_close` is gone: `session_stop`, `session_resume` and `session_delete` replace it.** `session_stop` saves the
+  session exactly as it is (every tab, the files) and stops billing; a stopped session is free and is kept for the plan's
+  retention days. `session_resume {sessionId}` brings it back as it was. `session_delete {sessionId}` deletes it for
+  good, with what it saved, its recording and its logs. The server resumes its default session itself when that one has
+  stopped (its time ran out, say); a tool given the id of a stopped session answers `session_not_running`: resume it first.
+
 ## 0.3.0 (2026-10-03)
 
 Built on the Node SDK 1.3 (`@boxline/sdk` `^1.3.0`).
