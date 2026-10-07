@@ -16,9 +16,17 @@ export interface ServerOptions {
   tools?: ToolSetting;
   /** Whether session_create and session_resume return the signed live view URL (a bearer link that controls the browser). Off when hosted. Default true. */
   liveUrls?: boolean;
+  /**
+   * Whether the tools say they sign in with OAuth (the hosted server, when it offers OAuth): every tool declares
+   * `securitySchemes: [{type: "oauth2", scopes: ["boxline"]}]` in `_meta`, the form OpenAI's apps read (the MCP SDK has no field for it).
+   */
+  oauth?: boolean;
 }
 
 const TEXT_LIMIT = 40_000;
+/** A crawl answer holds this many pages, each cut at this many characters, so it fits TEXT_LIMIT. */
+const CRAWL_PAGES_PER_CALL = 10;
+const CRAWL_PAGE_CHARS = 3_500;
 
 const INSTRUCTIONS =
   "Boxline gives you an isolated cloud machine: a Chrome browser, a bash shell and a /workspace disk. " +
@@ -81,6 +89,7 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
         description: meta.description,
         inputSchema: z.object(shape),
         annotations: { title: meta.title, readOnlyHint: meta.effect === "read", destructiveHint: meta.effect === "destroy", openWorldHint: meta.web },
+        ...(opts.oauth ? { _meta: { securitySchemes: [{ type: "oauth2", scopes: ["boxline"] }] } } : {}),
       },
       (async (args: z.infer<z.ZodObject<S>>) => {
         try {
@@ -528,6 +537,16 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
     },
   );
 
+  tool(
+    "delete_file",
+    { title: "Delete a file", description: "Delete a file from the session workspace. It cannot be brought back.", effect: "destroy", web: false },
+    { sessionId, path: z.string() },
+    async (a) => {
+      await (await machine(a.sessionId)).files.delete(a.path);
+      return text(`Deleted ${a.path}.`);
+    },
+  );
+
   // ---------- no session needed ----------
 
   tool(
@@ -581,6 +600,110 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
         return x.content ? `${head}\n\n${x.content}\n` : head;
       });
       return text(`Search results for "${r.query}"${r.cached ? " (cached)" : ""}:\n\n${lines.join("\n\n")}`);
+    },
+  );
+
+  /** A crawl and one page of its pages, as text: how far it got, then each page (its content capped so many fit). */
+  async function crawlReport(id: string, after?: string): Promise<string> {
+    const job = await client.crawl.get(id, { limit: CRAWL_PAGES_PER_CALL, after });
+    const head =
+      `Crawl ${job.id} of ${job.url}: ${job.status}; ${job.pagesDone} pages read, ${job.pagesFailed} failed, ${job.skippedByRobots} skipped by robots.txt.` +
+      (job.error ? ` Error: ${job.error}` : "");
+    const pages = job.data.map((pg) => {
+      const where = `${pg.finalUrl ?? pg.url} (${pg.status === null ? "no answer" : `HTTP ${pg.status}`}, depth ${pg.depth})`;
+      if (pg.error) return `## ${pg.title ?? pg.url}\n${where}\nFailed: ${pg.error}`;
+      if (pg.captcha) return `## ${pg.title ?? pg.url}\n${where}\nThe page showed a CAPTCHA (${pg.captcha}); it was not read.`;
+      const body = pg.content ?? "";
+      return `## ${pg.title ?? pg.url}\n${where}\n\n${body.length > CRAWL_PAGE_CHARS ? `${body.slice(0, CRAWL_PAGE_CHARS)}\n[… page cut at ${CRAWL_PAGE_CHARS} characters]` : body}`;
+    });
+    const more =
+      job.next ? `More pages: call crawl_results with crawlId "${job.id}" and after "${job.next}".`
+      : job.status === "running" ? `The crawl is still running: call crawl_results with crawlId "${job.id}"${after ? ` and after "${after}"` : ""} in a few seconds.`
+      : "That is every page.";
+    return [head, ...pages, more].join("\n\n");
+  }
+
+  tool(
+    "crawl_site",
+    {
+      title: "Crawl a website",
+      description:
+        "Crawl a website from a start URL (no session needed): follow its links, read each page in a real browser and return the pages as markdown, text or HTML. " +
+        "Respects robots.txt and stays on the start page's host unless sameHost is false. Waits up to waitSeconds (default 45) and returns the pages read so far; " +
+        "while it is still running, crawl_results gives the rest. Public pages only.",
+      effect: "read",
+      web: true,
+    },
+    {
+      url: z.string(),
+      maxPages: z.number().int().min(1).max(200).optional().describe("Pages to read, 1 to 200 (default 20)"),
+      maxDepth: z.number().int().min(0).max(10).optional().describe("Link depth from the start page, 0 to 10 (default 3)"),
+      include: z.array(z.string()).max(20).optional().describe("Only follow URLs that match one of these regular expressions"),
+      exclude: z.array(z.string()).max(20).optional().describe("Never follow URLs that match one of these regular expressions"),
+      sameHost: z.boolean().optional().describe("Stay on the start page's host (default true)"),
+      format: z.enum(["markdown", "text", "html"]).optional(),
+      waitSeconds: z.number().int().min(0).max(120).optional().describe("How long to wait for the crawl before answering (default 45)"),
+    },
+    async (a) => {
+      let job = await client.crawl.start({ url: a.url, maxPages: a.maxPages, maxDepth: a.maxDepth, include: a.include, exclude: a.exclude, sameHost: a.sameHost, format: a.format ?? "markdown" });
+      const until = Date.now() + (a.waitSeconds ?? 45) * 1000;
+      while (job.status === "running" && Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 2000));
+        job = await client.crawl.get(job.id, { limit: 0 });
+      }
+      return text(await crawlReport(job.id));
+    },
+  );
+
+  tool(
+    "crawl_results",
+    {
+      title: "Get a crawl's pages",
+      description: `The state of a crawl started with crawl_site and its next pages (${CRAWL_PAGES_PER_CALL} at a time; pass the after it gives to go on).`,
+      effect: "read",
+      web: false,
+    },
+    { crawlId: z.string().min(1), after: z.string().optional() },
+    async (a) => text(await crawlReport(a.crawlId, a.after)),
+  );
+
+  tool(
+    "extract_data",
+    {
+      title: "Extract data from pages",
+      description:
+        "Read up to 10 pages in a real browser and return the data asked for as JSON (no session needed): give url or urls, and a prompt saying what to collect " +
+        "or a JSON Schema for exact fields. A page that does not show a value gives null, never a guess. Uses a model, billed like other model calls. Public pages only.",
+      effect: "read",
+      web: true,
+    },
+    {
+      url: z.string().optional(),
+      urls: z.array(z.string()).min(1).max(10).optional(),
+      prompt: z.string().max(4000).optional().describe("What to collect, in words"),
+      schema: z.record(z.string(), z.unknown()).optional().describe("A JSON Schema the result must match"),
+    },
+    async (a) => {
+      if (!a.url && !a.urls?.length) throw new Error("give url or urls");
+      if (!a.prompt && !a.schema) throw new Error("give a prompt or a schema");
+      const r = await client.extract({ url: a.url, urls: a.urls, prompt: a.prompt, schema: a.schema });
+      const pages = r.pages.map((pg) => `- ${pg.finalUrl ?? pg.url}: ${pg.error ? `not read (${pg.error.code}: ${pg.error.message})` : `HTTP ${pg.status}`}`);
+      return text(`${JSON.stringify(r.data, null, 2)}\n\nPages:\n${pages.join("\n")}`);
+    },
+  );
+
+  tool(
+    "screenshot_url",
+    {
+      title: "Screenshot a web page",
+      description: "Take a screenshot of a web page in a fresh browser (no session needed). fullPage captures the whole page instead of the first screen.",
+      effect: "read",
+      web: true,
+    },
+    { url: z.string(), fullPage: z.boolean().optional() },
+    async (a) => {
+      const bytes = await client.screenshot(a.url, { format: "jpeg", quality: 60, fullPage: a.fullPage });
+      return { content: [{ type: "image" as const, data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" }] };
     },
   );
 

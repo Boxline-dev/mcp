@@ -6,7 +6,9 @@
  *   boxline-mcp           stdio. Env: BOXLINE_API_KEY, BOXLINE_API_URL (default https://api.boxline.dev, the Node SDK's;
  *                         http://localhost:8080 for a local API).
  *   boxline-mcp --http    HTTP on /mcp (POST). Env: MCP_PORT (8081), MCP_HOST (0.0.0.0), MCP_ALLOWED_HOSTS, MCP_TOOLS
- *                         (full or directory), BOXLINE_API_URL. Each request carries its own API key as a Bearer token.
+ *                         (full or directory), BOXLINE_API_URL. Each request carries its own API key, or the OAuth access
+ *                         token a person gave an MCP client by connecting it, as a Bearer token. MCP_RESOURCE and
+ *                         MCP_AUTH_SERVER (both) turn on OAuth sign-in discovery; MCP_OPENAI_CHALLENGE, MCP_TOKEN_CACHE_SECONDS.
  *
  * `session_create` returns a sessionId; every tool that needs a machine takes it as `sessionId`.
  */
@@ -37,7 +39,7 @@ async function main() {
 
   const config = httpConfigFromEnv();
   const running = await startHttp(config);
-  process.stderr.write(`boxline-mcp: HTTP on ${config.host}:${running.port}/mcp (tools: ${config.tools})\n`);
+  process.stderr.write(`boxline-mcp: HTTP on ${config.host}:${running.port}/mcp (tools: ${config.tools}, OAuth sign-in: ${config.resource ? "on" : "off"})\n`);
   let stopping = false;
   const stop = () => {
     if (stopping) return;

@@ -2,6 +2,28 @@
 
 All notable changes to `@boxline/mcp`.
 
+## 2.1.0 (2026-10-07)
+
+### Added
+
+- **Crawling, scraping and the disk.** These need no session:
+  - `crawl_site` crawls a site from a start URL (robots.txt respected, same host by default, up to 200 pages). It waits up
+    to `waitSeconds` and returns the pages read so far.
+  - `crawl_results` pages through a crawl's results.
+  - `extract_data` returns JSON from up to 10 pages, from a `prompt` or a JSON `schema`.
+  - `screenshot_url` takes a screenshot without a session.
+
+  `delete_file` removes a file from the session's workspace.
+- **OAuth sign-in for the HTTP mode.** With `MCP_RESOURCE` and `MCP_AUTH_SERVER` set, the server publishes OAuth protected resource
+  metadata (`GET /.well-known/oauth-protected-resource`, RFC 9728) and answers a missing token with `401` and
+  `WWW-Authenticate: Bearer resource_metadata="…", scope="boxline openid email offline_access"` (plus `error="invalid_token"` when a
+  token was sent and refused), so ChatGPT, Claude and other clients can offer "Connect" instead of asking for an API key. An OAuth access
+  token (`bxo_…`) always gets the `directory` tools; an API key keeps `MCP_TOOLS`. Every tool declares `oauth2` with the `boxline` scope in its
+  `_meta.securitySchemes` when OAuth is on. `GET /.well-known/openai-apps-challenge` answers `MCP_OPENAI_CHALLENGE` for OpenAI's domain check.
+- **Tokens are checked before a request is served.** One `GET /v1/auth/me` per token, remembered by its hash for `MCP_TOKEN_CACHE_SECONDS`
+  (default 60): a token the API refuses (expired, revoked, unknown) is `401` with the challenge above instead of a tool error on the first
+  call. Any other answer from the API lets the request through.
+
 ## 2.0.0 (2026-10-07)
 
 Moves to the MCP TypeScript SDK 2 (`@modelcontextprotocol/server`) and the MCP revision 2026-07-28. Clients that speak the
