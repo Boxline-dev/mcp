@@ -35,7 +35,8 @@ claude mcp add boxline --env BOXLINE_API_KEY=bxl_your_key -- npx -y @boxline/mcp
 ## Tools
 
 The server keeps nothing between calls: `session_create` returns a `sessionId`, and every tool that works in a session
-takes it as a required `sessionId` (a stopped session is resumed first, as it was). `fetch_url` and `web_search` need no
+takes it as a required `sessionId` (a tool that acts resumes a stopped session first, as it was; the read-only ones,
+`browser_read`, `browser_screenshot`, `list_files` and `read_file`, say to call `session_resume` instead). `fetch_url` and `web_search` need no
 session.
 
 Every tool says what it does to the world in its MCP annotations (a title, and read-only, destructive and open-world
@@ -82,7 +83,7 @@ through the chat: add them yourself, outside the conversation.
 Sessions are billed while they run: stop them with `session_stop` when the work is done, or let them stop at their time
 limit. A stopped session is free and is kept for your plan's retention days (7 on Free, 30 on Hobby and Startup, 90 on
 Scale): `session_resume` brings it back with its tabs and files, and `session_delete` removes it at once, with its
-recording and logs. A tool given the id of a stopped session resumes it first.
+recording and logs. A tool that acts, given the id of a stopped session, resumes it first; a read-only tool says to call `session_resume`.
 
 ## Self-hosting over HTTP
 

@@ -13,7 +13,8 @@ Moves to the MCP TypeScript SDK 2 (`@modelcontextprotocol/server`) and the MCP r
   in a session (`browser_*`, `mouse_*`, `hover`, `key`, `computer`, `run_command`, `run_playwright`, `list_files`,
   `read_file`, `write_file`, `session_stop`, `session_resume`, `session_delete`, `session_move`, `browser_login`) takes it
   as a required `sessionId`. The server keeps nothing between calls, as the new MCP revision asks: state travels as a handle
-  in the arguments. A tool given the id of a stopped session resumes it first, as it was. `fetch_url`, `web_search`,
+  in the arguments. A tool that acts, given the id of a stopped session, resumes it first, as it was; the read-only tools (`browser_read`,
+  `browser_screenshot`, `list_files`, `read_file`) refuse it and say to call `session_resume` (a resume starts billing). `fetch_url`, `web_search`,
   `session_create` and `credentials_list` take none.
 - **Node 20 or newer** (`engines.node`).
 
