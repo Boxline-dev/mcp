@@ -2,6 +2,41 @@
 
 All notable changes to `@boxline/mcp`.
 
+## 2.0.0 (2026-10-07)
+
+Moves to the MCP TypeScript SDK 2 (`@modelcontextprotocol/server`) and the MCP revision 2026-07-28. Clients that speak the
+2025 protocol keep working.
+
+### Breaking
+
+- **No default session: `sessionId` is required.** `session_create` returns the session's id, and every tool that works
+  in a session (`browser_*`, `mouse_*`, `hover`, `key`, `computer`, `run_command`, `run_playwright`, `list_files`,
+  `read_file`, `write_file`, `session_stop`, `session_resume`, `session_delete`, `session_move`, `browser_login`) takes it
+  as a required `sessionId`. The server keeps nothing between calls, as the new MCP revision asks: state travels as a handle
+  in the arguments. A tool given the id of a stopped session resumes it first, as it was. `fetch_url`, `web_search`,
+  `session_create` and `credentials_list` take none.
+- **Node 20 or newer** (`engines.node`).
+
+### Added
+
+- **HTTP mode: `boxline-mcp --http`** serves the tools at `POST /mcp` for clients that connect to a URL. Every request
+  carries its own API key as `Authorization: Bearer <API key>` (`401` with `WWW-Authenticate: Bearer` without it), and the
+  server is stateless, so any number of copies behind a load balancer can serve any request. It serves 2026-07-28 clients
+  and, statelessly, the 2025-era protocol. `GET /healthz` answers `200 ok`. Settings: `MCP_PORT` (8081), `MCP_HOST`
+  (0.0.0.0), `MCP_ALLOWED_HOSTS` (host names it answers to; a request with another `Host`, or a browser `Origin` that is not
+  one of them, gets `403`), `MCP_TOOLS` and `BOXLINE_API_URL`. Request bodies are limited to 4 MiB and 32 requests run at once (`MCP_MAX_IN_FLIGHT`); live view URLs are left out of tool results. See the README.
+- **Tool annotations.** Every tool has a title and explicit `readOnlyHint`, `destructiveHint` and `openWorldHint`, so clients
+  can decide what to ask about: `browser_read`, `browser_screenshot`, `list_files`, `read_file`, `credentials_list`,
+  `fetch_url` and `web_search` are read-only; `session_delete`, `write_file`, `run_command` and `run_playwright` are
+  destructive; tools that reach the web are open-world.
+- **`MCP_TOOLS=directory`** (HTTP mode) leaves out `browser_login`, `credentials_list` and every credential parameter
+  (`credential` and `field` on `browser_type`, `credentials` on `session_create`), for servers listed in a public connector
+  directory. The default, `full`, is unchanged.
+- The server's version in the MCP handshake is the package's own version, and the server sends short usage instructions
+  (create a session first, pass its id).
+- `session_create` also returns whether the session has a shell. When no `shell` is asked for and the plan or the API does
+  not allow one, it creates a browser-only session, as the default session used to.
+
 ## 1.0.0 (2026-10-05)
 
 Built on the Node SDK 2.0 (`@boxline/sdk` `^2.0.0`).

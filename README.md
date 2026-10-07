@@ -8,7 +8,7 @@ run commands, read and write files, fetch pages and search the web.
 
 ## Set it up
 
-You need a Boxline API key (console → API keys) and Node 18 or newer.
+You need a Boxline API key (console → API keys) and Node 20 or newer.
 
 Claude Desktop, Cursor and other clients that take a JSON config:
 
@@ -34,8 +34,12 @@ claude mcp add boxline --env BOXLINE_API_KEY=bxl_your_key -- npx -y @boxline/mcp
 
 ## Tools
 
-Every tool takes an optional `sessionId`. Without one, the server uses its current session, or starts one (a browser
-and, when the plan has them, a shell), so an agent can call `browser_navigate` and start working.
+The server keeps nothing between calls: `session_create` returns a `sessionId`, and every tool that works in a session
+takes it as a required `sessionId` (a stopped session is resumed first, as it was). `fetch_url` and `web_search` need no
+session.
+
+Every tool says what it does to the world in its MCP annotations (a title, and read-only, destructive and open-world
+hints), so a client can decide what to ask you about.
 
 | Group | Tools |
 |---|---|
@@ -54,12 +58,12 @@ The agent calls `credentials_list` to see what exists (names, types and the site
 types it with `browser_type`:
 
 ```
-browser_type { "credential": "SHOP", "field": "username", "selector": "#email" }
-browser_type { "credential": "SHOP", "field": "password", "selector": "#password" }
-browser_type { "credential": "SHOP", "field": "otp", "selector": "#code" }   // the current 2FA code, if the password has a 2FA key
+browser_type { "sessionId": "<id>", "credential": "SHOP", "field": "username", "selector": "#email" }
+browser_type { "sessionId": "<id>", "credential": "SHOP", "field": "password", "selector": "#password" }
+browser_type { "sessionId": "<id>", "credential": "SHOP", "field": "otp", "selector": "#code" }   // the current 2FA code, if the password has a 2FA key
 ```
 
-Or sign in in one call with `browser_login { "credential": "SHOP", "url": "https://shop.example.com/login" }`: a short run in the
+Or sign in in one call with `browser_login { "sessionId": "<id>", "credential": "SHOP", "url": "https://shop.example.com/login" }`: a short run in the
 session types the credential on its sites only, and the agent sees neither the password nor any code. A password whose
 `codeSource` (in `credentials_list`) is `push` or `url` waits for the code or sign-in link that your system sends, up to its
 timeout (the agent should tell you a code is needed); you send it with the CLI (`boxline credentials push-code SHOP`) or
@@ -78,7 +82,35 @@ through the chat: add them yourself, outside the conversation.
 Sessions are billed while they run: stop them with `session_stop` when the work is done, or let them stop at their time
 limit. A stopped session is free and is kept for your plan's retention days (7 on Free, 30 on Hobby and Startup, 90 on
 Scale): `session_resume` brings it back with its tabs and files, and `session_delete` removes it at once, with its
-recording and logs. The default session is resumed by the server when it has stopped.
+recording and logs. A tool given the id of a stopped session resumes it first.
+
+## Self-hosting over HTTP
+
+`boxline-mcp --http` serves the same tools over HTTP at `POST /mcp`, for clients that connect to a URL instead of starting a
+process. It speaks the MCP revision 2026-07-28 and, without sessions, the 2025-era protocol older clients still use.
+
+```bash
+MCP_ALLOWED_HOSTS=mcp.example.com BOXLINE_API_URL=https://api.boxline.dev npx -y @boxline/mcp --http
+```
+
+- **Sign-in:** every request carries its own Boxline API key as `Authorization: Bearer <API key>`; without it the answer is
+  `401` with `WWW-Authenticate: Bearer`. The server holds no key of its own, never logs one, and calls the API with the
+  key of the request it is serving.
+- **Stateless:** each request is served on its own, so any number of copies behind a load balancer can answer any request,
+  and a restart loses nothing. Nothing is remembered between calls: the `sessionId` that `session_create` returns is
+  the only handle (as above). `GET /mcp` and `DELETE /mcp` answer `405`.
+- **Put it behind HTTPS** (a reverse proxy or load balancer). `GET /healthz` answers `200 ok` for health checks, on any host.
+- **Environment:**
+
+| Variable | Default | |
+|---|---|---|
+| `MCP_PORT` | `8081` | Port to listen on (`0` picks a free one). |
+| `MCP_HOST` | `0.0.0.0` | Address to bind. |
+| `BOXLINE_API_URL` | `https://api.boxline.dev` | The Boxline API the server calls. |
+| `MCP_ALLOWED_HOSTS` | none | Comma-separated host names the server answers to (`mcp.example.com`), against DNS rebinding. `localhost`, `127.0.0.1` and `[::1]` always pass; `*` turns the host and origin checks off. A request whose `Host` is not listed gets `403`, and so does a browser `Origin` that is not one of them. |
+| `MCP_TOOLS` | `full` | `directory` leaves out `browser_login`, `credentials_list` and every credential parameter (`credential` and `field` on `browser_type`, `credentials` on `session_create`): for a server listed in a public connector directory. |
+
+Request bodies are limited to 4 MiB (`413`), and at most 32 requests run at once (`MCP_MAX_IN_FLIGHT`; more get `503`). Live view URLs are left out of tool results. Long tool calls keep their connection alive with SSE comment frames every 15 seconds.
 
 ## Links
 

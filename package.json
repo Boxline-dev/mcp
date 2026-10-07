@@ -1,6 +1,6 @@
 {
   "name": "@boxline/mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MCP server that gives AI agents Boxline browsers, shells and files.",
   "type": "module",
   "main": "dist/index.js",
@@ -20,6 +20,9 @@
   "bugs": {
     "url": "https://github.com/Boxline-dev/mcp/issues"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -27,7 +30,8 @@
   },
   "dependencies": {
     "@boxline/sdk": "^2.0.0",
-    "@modelcontextprotocol/sdk": "^1.30.1",
+    "@modelcontextprotocol/node": "^2.1.1",
+    "@modelcontextprotocol/server": "^2.3.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
