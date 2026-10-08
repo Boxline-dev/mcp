@@ -22,6 +22,8 @@ import { createServer, type ToolSetting } from "./server.js";
 export const MAX_BODY_BYTES = 4 * 1024 * 1024;
 /** Requests served at once; more get 503, so a flood cannot run the container out of memory. */
 export const MAX_IN_FLIGHT = 32;
+/** Requests one bearer token may have running at once; more get 503, so one caller cannot hold every slot with long calls. */
+export const MAX_IN_FLIGHT_PER_TOKEN = 8;
 const LOOPBACK = ["localhost", "127.0.0.1", "[::1]"];
 
 export interface HttpOptions {
@@ -33,6 +35,8 @@ export interface HttpOptions {
   maxBodyBytes?: number;
   /** Requests served at once (MCP_MAX_IN_FLIGHT); more get 503. */
   maxInFlight?: number;
+  /** Requests one token may have running at once (MCP_MAX_IN_FLIGHT_PER_TOKEN, default 8); more get 503. */
+  maxInFlightPerToken?: number;
   /** SSE keep-alive interval in ms (default 15 000): bytes keep flowing while a long tool call runs, so a load balancer's idle timeout does not cut it. */
   keepAliveMs?: number;
   /** Where errors are reported (message only; never a token or a request). Defaults to stderr. */
@@ -57,8 +61,8 @@ const TOKEN_CHECK_TIMEOUT_MS = 5000;
 const TOKEN_CACHE_MAX = 10_000;
 
 /**
- * The HTTP settings from the environment: MCP_PORT, MCP_HOST, MCP_ALLOWED_HOSTS, MCP_TOOLS, MCP_MAX_IN_FLIGHT, BOXLINE_API_URL,
- * MCP_RESOURCE, MCP_AUTH_SERVER, MCP_OPENAI_CHALLENGE, MCP_TOKEN_CACHE_SECONDS. Throws on a bad value.
+ * The HTTP settings from the environment: MCP_PORT, MCP_HOST, MCP_ALLOWED_HOSTS, MCP_TOOLS, MCP_MAX_IN_FLIGHT,
+ * MCP_MAX_IN_FLIGHT_PER_TOKEN, BOXLINE_API_URL, MCP_RESOURCE, MCP_AUTH_SERVER, MCP_OPENAI_CHALLENGE, MCP_TOKEN_CACHE_SECONDS. Throws on a bad value.
  */
 export function httpConfigFromEnv(env: NodeJS.ProcessEnv = process.env): HttpOptions & { port: number; host: string } {
   const port = env.MCP_PORT === undefined || env.MCP_PORT === "" ? 8081 : Number(env.MCP_PORT);
@@ -81,6 +85,8 @@ export function httpConfigFromEnv(env: NodeJS.ProcessEnv = process.env): HttpOpt
   if (Boolean(resource) !== Boolean(authServer)) throw new Error("MCP_RESOURCE and MCP_AUTH_SERVER go together: set both (OAuth sign-in) or neither");
   const cache = env.MCP_TOKEN_CACHE_SECONDS === undefined || env.MCP_TOKEN_CACHE_SECONDS === "" ? undefined : Number(env.MCP_TOKEN_CACHE_SECONDS);
   if (cache !== undefined && (!Number.isFinite(cache) || cache < 0 || cache > 3600)) throw new Error(`MCP_TOKEN_CACHE_SECONDS must be 0 to 3600, got "${env.MCP_TOKEN_CACHE_SECONDS}"`);
+  const perToken = env.MCP_MAX_IN_FLIGHT_PER_TOKEN === undefined || env.MCP_MAX_IN_FLIGHT_PER_TOKEN === "" ? undefined : Number(env.MCP_MAX_IN_FLIGHT_PER_TOKEN);
+  if (perToken !== undefined && (!Number.isInteger(perToken) || perToken < 1)) throw new Error(`MCP_MAX_IN_FLIGHT_PER_TOKEN must be a whole number, 1 or more, got "${env.MCP_MAX_IN_FLIGHT_PER_TOKEN}"`);
   return {
     port,
     host: env.MCP_HOST || "0.0.0.0",
@@ -91,6 +97,7 @@ export function httpConfigFromEnv(env: NodeJS.ProcessEnv = process.env): HttpOpt
     apiUrl: env.BOXLINE_API_URL || undefined,
     tools,
     maxInFlight: env.MCP_MAX_IN_FLIGHT ? Number(env.MCP_MAX_IN_FLIGHT) : undefined,
+    maxInFlightPerToken: perToken,
     allowedHosts: (env.MCP_ALLOWED_HOSTS ?? "")
       .split(",")
       .map((h) => h.trim())
@@ -211,6 +218,9 @@ export function createHttpHandler(opts: HttpOptions = {}): HttpHandler {
   const maxBody = opts.maxBodyBytes ?? MAX_BODY_BYTES;
   const maxInFlight = opts.maxInFlight ?? MAX_IN_FLIGHT;
   let inFlight = 0;
+  // Requests running per token, counted by the SHA-256 of the token (never the token itself); an entry goes when its count reaches 0.
+  const maxPerToken = opts.maxInFlightPerToken ?? MAX_IN_FLIGHT_PER_TOKEN;
+  const perToken = new Map<string, number>();
   const log = opts.log ?? ((m: string) => process.stderr.write(`boxline-mcp: ${m}\n`));
   const onerror = (err: Error) => log(`error: ${err.message}`);
   const checks = new TokenChecks(opts.apiUrl, (opts.tokenCacheSeconds ?? 60) * 1000);
@@ -287,15 +297,21 @@ export function createHttpHandler(opts: HttpOptions = {}): HttpHandler {
       if (declared !== undefined && Number(declared) > maxBody) return rpcError(res, 413, `Request body too large: the limit is ${maxBody} bytes`);
 
       if (inFlight >= maxInFlight) return rpcError(res, 503, "Too many requests at once: retry shortly", { "retry-after": "1" });
+      const tokenHash = createHash("sha256").update(token).digest("hex");
+      if ((perToken.get(tokenHash) ?? 0) >= maxPerToken) return rpcError(res, 503, "Too many requests at once for this token: retry shortly", { "retry-after": "1" });
 
       // One line per request: the client's address, the MCP method and name (2026-07-28 clients send them as headers),
       // the status and a short hash of the token to tell callers apart. Never the token itself.
       const started = Date.now();
-      const key = createHash("sha256").update(token).digest("hex").slice(0, 8);
+      const key = tokenHash.slice(0, 8);
       const what = [req.headers["mcp-method"], req.headers["mcp-name"]].filter((v) => typeof v === "string" && v).join(" ") || "-";
       inFlight++;
+      perToken.set(tokenHash, (perToken.get(tokenHash) ?? 0) + 1);
       res.once("close", () => {
         inFlight--;
+        const left = (perToken.get(tokenHash) ?? 1) - 1;
+        if (left > 0) perToken.set(tokenHash, left);
+        else perToken.delete(tokenHash);
         log(`${req.method} ${res.statusCode} ${Date.now() - started}ms ip=${clientIp(req)} key=${key} ${what.replace(/[^\x20-\x7e]/g, "?").slice(0, 120)}`);
       });
 

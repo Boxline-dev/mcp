@@ -10,7 +10,7 @@
  *                         token a person gave an MCP client by connecting it, as a Bearer token. MCP_RESOURCE and
  *                         MCP_AUTH_SERVER (both) turn on OAuth sign-in discovery; MCP_OPENAI_CHALLENGE, MCP_TOKEN_CACHE_SECONDS.
  *
- * `session_create` returns a sessionId; every tool that needs a machine takes it as `sessionId`.
+ * `session_create` returns a sessionId; every tool that needs a machine takes it as `sessionId` (`session_list` finds one again).
  */
 import { Boxline } from "@boxline/sdk";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";

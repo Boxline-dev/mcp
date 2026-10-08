@@ -35,23 +35,30 @@ claude mcp add boxline --env BOXLINE_API_KEY=bxl_your_key -- npx -y @boxline/mcp
 ## Tools
 
 The server keeps nothing between calls: `session_create` returns a `sessionId`, and every tool that works in a session
-takes it as a required `sessionId` (a tool that acts resumes a stopped session first, as it was; the read-only ones,
-`browser_read`, `browser_screenshot`, `list_files` and `read_file`, say to call `session_resume` instead). `fetch_url`, `web_search`, `screenshot_url`,
-`crawl_site`, `crawl_results` and `extract_data` need no session.
+takes it as a required `sessionId` (`session_list` finds an id again; a tool that acts resumes a stopped session first, as it
+was; `browser_read` and `browser_screenshot` say to call `session_resume` instead, because a resume starts a machine and billing;
+`files_list` and `files_read` read a stopped session's saved files without resuming it). `session_create`, `session_list`, `credentials_list` and the `web_*` tools need no session.
+
+A session is a browser, a shell or both: `session_create` takes `browser` and `shell` (both `true` unless you say otherwise).
+`browser: false` with a shell is a shell-only session, with no live view: the `browser_*` tools answer `browser_disabled`.
 
 Every tool says what it does to the world in its MCP annotations (a title, and read-only, destructive and open-world
-hints), so a client can decide what to ask you about.
+hints), so a client can decide what to ask you about. There are 26 tools:
 
 | Group | Tools |
 |---|---|
-| Sessions | `session_create` (optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_stop` (saves the session as it is and stops billing), `session_resume` (brings a stopped session back as it was), `session_delete` (deletes it and what it saved, for good), `session_move` (to a fresh machine, keeping tabs, logins and files) |
-| Browser | `browser_navigate`, `browser_click`, `browser_type` (text, or a saved credential), `browser_login` (sign in with a saved password), `browser_press`, `browser_read` (Markdown or text), `browser_screenshot` |
+| Sessions | `session_create` (a browser, a shell or both; optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_list` (find a session again), `session_stop` (saves the session as it is and stops billing), `session_resume` (brings a stopped session back as it was), `session_delete` (deletes it and what it saved, for good) |
+| Browser | `browser_navigate`, `browser_act` (one or more steps in plain English or as exact actions: hover, scroll, drag, right and double clicks…), `browser_click` (a selector or x/y), `browser_type` (text, or a saved credential), `browser_press` (keys: `Enter`, `Control+A`, `ctrl+a Delete`), `browser_read` (Markdown or text), `browser_screenshot`, `browser_login` (sign in with a saved password), `browser_computer` (screenshot-driven computer use) |
+| Shell | `shell_exec` (bash in the session) |
+| Files | `files_list`, `files_read`, `files_write`, `files_delete` (the session's workspace, its disk) |
+| Web | `web_fetch` (a page through a real browser), `web_search` (with the top pages as Markdown), `web_screenshot` (a quick screenshot), `web_extract` (JSON from up to 10 pages, from a prompt or a JSON Schema), `web_crawl_start` and `web_crawl_get` (a whole site or section, robots.txt respected); none needs a session |
 | Credentials | `credentials_list` (names, types, sites and a password's code source for the saved passwords and secrets, never their values) |
-| Mouse and keyboard | `mouse_move`, `mouse_click`, `mouse_drag`, `hover`, `key`, `computer` (screenshot-driven computer use) |
-| Shell and code | `run_command` (bash in the session), `run_playwright` (Playwright code next to the browser) |
-| Files | `list_files`, `read_file`, `write_file`, `delete_file` (the session's workspace, its disk) |
-| Web | `fetch_url` (a page through a real browser), `web_search` (with the top pages as Markdown), `screenshot_url` (a quick screenshot); none needs a session |
-| Crawl and scrape | `crawl_site` and `crawl_results` (a whole site or section, robots.txt respected, up to 200 pages), `extract_data` (JSON from up to 10 pages, from a prompt or a JSON Schema); no session needed |
+
+`browser_act` is the tool for everything the others do not cover. A plain-English step ("click the Sign in link") is carried
+out by a model, like a step of an agent run: it is billed as one and needs a plan that includes plain-English steps. An exact
+action (`{"action": "hover", "selector": "text=Products"}`) uses no model. Each step gets one line saying what happened; an
+`evaluate` step also gives the value it returned (`{"action": "evaluate", "expression": "document.title"}`). There are no agent-run tools: an MCP client is
+already an agent.
 
 ### Signing in without showing the agent a password
 
@@ -75,7 +82,7 @@ The platform types the value into the field itself, only on the sites the creden
 the agent, the chat or the logs: wherever a result would show it (`browser_read`, the page's elements, a screenshot, an
 error), the text is replaced by `%SHOP.password%` and the field is covered. **This hides a value; it does not protect
 it.** It is a guard against showing a credential by accident, not a boundary: code that runs in the page or the session
-(`run_playwright`, a command in `run_command`) can still read a field and print it, for example reversed or in base64. Use a
+(an `evaluate` action in `browser_act`, a command in `shell_exec`) can still read a field and print it, for example reversed or in base64. Use a
 password only in sessions whose pages and scripts you trust, and save it with the narrowest sites. `session_create` can also start from a saved browser `profile` (cookies and logins from an
 earlier sign-in; `persistProfile` saves new ones back) and export `credentials` into the session's shell as environment
 variables, for those credentials that allow it. No tool creates or changes a credential, so a password never passes
@@ -84,7 +91,7 @@ through the chat: add them yourself, outside the conversation.
 Sessions are billed while they run: stop them with `session_stop` when the work is done, or let them stop at their time
 limit. A stopped session is free and is kept for your plan's retention days (7 on Free, 30 on Hobby and Startup, 90 on
 Scale): `session_resume` brings it back with its tabs and files, and `session_delete` removes it at once, with its
-recording and logs. A tool that acts, given the id of a stopped session, resumes it first; a read-only tool says to call `session_resume`.
+recording and logs. A tool that acts, given the id of a stopped session, resumes it first; `browser_read` and `browser_screenshot` say to call `session_resume`; `files_list` and `files_read` read the saved files as they are.
 
 ## Self-hosting over HTTP
 
@@ -122,9 +129,9 @@ MCP_ALLOWED_HOSTS=mcp.example.com BOXLINE_API_URL=https://api.boxline.dev npx -y
 | `MCP_RESOURCE`, `MCP_AUTH_SERVER` | none | Both or neither: turn on OAuth sign-in discovery (above; Boxline's hosted server only). |
 | `MCP_OPENAI_CHALLENGE` | none | The token ChatGPT's domain verification expects at `/.well-known/openai-apps-challenge`. |
 | `MCP_TOKEN_CACHE_SECONDS` | `60` | How long a token's check against the API is remembered (`0`: every request). |
-| `MCP_TOOLS` | `full` | `directory` leaves out `browser_login`, `credentials_list` and every credential parameter (`credential` and `field` on `browser_type`, `credentials` on `session_create`): for a server listed in a public connector directory. |
+| `MCP_TOOLS` | `full` | `directory` leaves out `browser_login`, `credentials_list` and every credential parameter (`credential` and `field` on `browser_type`, `credentials` on `session_create`), and `browser_act` refuses an action that names a credential or logs in: for a server listed in a public connector directory. |
 
-Request bodies are limited to 4 MiB (`413`), and at most 32 requests run at once (`MCP_MAX_IN_FLIGHT`; more get `503`). Live view URLs are left out of tool results. Long tool calls keep their connection alive with SSE comment frames every 15 seconds.
+Request bodies are limited to 4 MiB (`413`), at most 32 requests run at once (`MCP_MAX_IN_FLIGHT`; more get `503`), and at most 8 per bearer token (`MCP_MAX_IN_FLIGHT_PER_TOKEN`; more get `503`, so one caller cannot hold every slot). Live view URLs are left out of tool results. Long tool calls keep their connection alive with SSE comment frames every 15 seconds.
 
 ## Links
 

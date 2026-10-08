@@ -2,6 +2,66 @@
 
 All notable changes to `@boxline/mcp`.
 
+## 3.0.0 (2026-10-07)
+
+The tool set was redesigned: 26 tools with names that say what they are (`session_*`, `browser_*`, `shell_*`, `files_*`, `web_*`), a
+tool for everything the browser can do (`browser_act`), and shell-only sessions. Built on the Node SDK 3.0 (`@boxline/sdk`
+`^3.0.0`) and an API from 7 October 2026 or later.
+
+### Breaking
+
+- **Tools were renamed** (same behaviour, same inputs unless a row below says otherwise):
+
+| 2.x | 3.0.0 |
+|---|---|
+| `computer` | `browser_computer` |
+| `run_command` | `shell_exec` |
+| `list_files`, `read_file`, `write_file`, `delete_file` | `files_list`, `files_read`, `files_write`, `files_delete` |
+| `fetch_url` | `web_fetch` |
+| `screenshot_url` | `web_screenshot` |
+| `extract_data` | `web_extract` |
+| `crawl_site`, `crawl_results` | `web_crawl_start`, `web_crawl_get` |
+
+- **Tools were merged or removed, with no replacement tool:**
+
+| 2.x | 3.0.0 |
+|---|---|
+| `key` | merged into `browser_press`: it takes `keys` (was `key`) and sends the key action, so it takes combinations (`Control+A`), several in a row (`ctrl+a Delete`), and the names `ctrl`, `cmd` and `Return` |
+| `hover` | `browser_act` with a hover action, e.g. `{"action": "hover", "selector": "text=Products"}` (or `browser_computer`) |
+| `mouse_move`, `mouse_click`, `mouse_drag` | `browser_act` with move, click and drag actions; `browser_click` takes `x` and `y`; `browser_computer` moves and drags by x/y |
+| `run_playwright` | none: use `browser_act` and `shell_exec`; the API and the SDKs run scripts |
+| `session_move` | none: the platform moves a session itself when its machine goes away |
+
+- **`session_create` has a `browser` input** (default `true`; it used to always create a browser). With `browser: false` and a
+  shell the session is a shell-only session: there is no live view (`liveUrl` is `null`) and the `browser_*` tools answer
+  `browser_disabled`. The browser-only fallback (a failed shell create retried without a shell) is skipped when `browser` is
+  `false`, because there would be nothing left, and you see the real error.
+- **`files_list` and `files_read` work on a stopped session**: they read its saved workspace without resuming it (2.x: they refused it
+  and said to call `session_resume`). `browser_read` and `browser_screenshot` still refuse a stopped session, because a resume starts
+  a machine and billing.
+- **`browser_click` takes a selector or `x` and `y` only** (the `mouse_click` options, a right or double click, are `browser_act`
+  actions).
+- **Needs an API from 7 October 2026**: the tools call the new routes (`/browser/actions`, `/browser/computer`, `/shell/exec`,
+  `/v1/crawls`, `GET /v1/sessions`).
+
+### Added
+
+- **`browser_act`**: one or more steps in one call, each a plain-English sentence ("click the Sign in link") or an exact action
+  object (click, hover, scroll, drag, right and double clicks, key presses, wait, evaluate…). It stops at the first step that
+  fails and says what each step did (an `evaluate` step also gives the value it returned, `extract` its data, `elements` the numbered
+  elements of the page, `tabs` the open tabs). A plain-English step is carried out by a model, so it is billed like a step of an agent run
+  and needs a plan with plain-English steps; an action object uses no model. With `MCP_TOOLS=directory` it refuses an action that
+  names a saved credential or logs in.
+- **`session_list`**: find a session again (the server keeps nothing, so a model that loses a `sessionId` gets it back here).
+  Filters: `status` (comma-separated), `kind` (`browser`, `shell`, `combined`), `q` (an id prefix or text in `userMetadata`),
+  `limit` and `after` for the next page. Read-only.
+- `web_crawl_start`'s `maxPages` goes up to 1000 (the plan's crawl limit applies; it was 200).
+- `web_crawl_start` is no longer marked read-only (`readOnlyHint: false`, not destructive, open-world): it creates a crawl job and spends credit
+  up to the plan's page limit, so a client asks before running it. `web_crawl_get` stays read-only.
+- **A per-token limit on the hosted server**: at most 8 requests at once for one bearer token (`MCP_MAX_IN_FLIGHT_PER_TOKEN`; more get
+  `503` with `Retry-After: 1`, like the global limit of 32), so one caller cannot hold every slot with long `shell_exec` calls. The
+  count is kept by a hash of the token, never the token.
+
 ## 2.1.0 (2026-10-07)
 
 ### Added

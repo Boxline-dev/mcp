@@ -5,7 +5,7 @@
  * session is resumed first, as it was).
  */
 import { McpServer } from "@modelcontextprotocol/server";
-import { Boxline, BoxlineError, CredentialLoginFailedError, type Session } from "@boxline/sdk";
+import { Boxline, BoxlineError, CredentialLoginFailedError, type ActionItem, type ActionResult, type ComputerAction, type Session, type SessionStatus } from "@boxline/sdk";
 import { z } from "zod";
 import { VERSION } from "./version.js";
 
@@ -27,11 +27,13 @@ const TEXT_LIMIT = 40_000;
 /** A crawl answer holds this many pages, each cut at this many characters, so it fits TEXT_LIMIT. */
 const CRAWL_PAGES_PER_CALL = 10;
 const CRAWL_PAGE_CHARS = 3_500;
+/** What browser_act shows of one step's value (an evaluate result, extracted data), so many steps fit TEXT_LIMIT. */
+const ACTION_VALUE_CHARS = 8_000;
 
 const INSTRUCTIONS =
-  "Boxline gives you an isolated cloud machine: a Chrome browser, a bash shell and a /workspace disk. " +
-  "Call session_create first and pass the sessionId it returns to every other session tool. " +
-  "fetch_url and web_search need no session. Call session_stop when you are done: billing stops and session_resume brings the session back as it was.";
+  "Boxline gives you an isolated cloud machine: a Chrome browser, a bash shell and a /workspace disk (a session is a browser, a shell or both). " +
+  "Call session_create first and pass the sessionId it returns to every other session tool; session_list finds an id again. " +
+  "web_fetch, web_search, web_screenshot, web_extract and the web_crawl tools need no session. Call session_stop when you are done: billing stops and session_resume brings the session back as it was.";
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s.length > TEXT_LIMIT ? `${s.slice(0, TEXT_LIMIT)}\n[… truncated]` : s }] });
 const fail = (err: unknown) => ({
@@ -52,27 +54,6 @@ interface ToolMeta {
   web: boolean;
   /** Parameters left out of the `directory` setting (the credential ones). */
   omitInDirectory?: string[];
-}
-
-/**
- * Browser settings the API takes on sessions and fetch (docs/CONTRACT.md). Not in the SDK's types yet, so they are
- * passed in a separate object (the SDK sends every field it is given).
- */
-type BrowserSettings = { blockAds?: boolean; cookieBanners?: "reject" | "off" };
-
-interface ActionResult {
-  ok: boolean;
-  value?: any;
-  error?: string;
-  code?: string;
-  text?: string;
-}
-
-/** POST /v1/search. Uses the SDK's low-level request until the SDK has its own search method. */
-interface SearchAnswer {
-  query: string;
-  cached: boolean;
-  results: { title: string; url: string; snippet: string; publishedAt?: string; siteName?: string; content?: string | null; error?: { code: string; message: string } | null }[];
 }
 
 export function createServer(client: Boxline, opts: ServerOptions = {}): McpServer {
@@ -112,7 +93,8 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
 
   /**
    * The machine a tool works in. A stopped session is brought back as it was (a new machine: billing starts again), except
-   * for the read-only tools, which say so instead; anything else the API refuses says so.
+   * for the read-only browser tools (browser_read, browser_screenshot), which say so instead; anything else the API refuses
+   * says so. The file tools files_list and files_read do not use this: they read a stopped session's saved files directly.
    */
   async function machine(id: string, resume = true): Promise<Session> {
     const s = await client.sessions.get(id);
@@ -123,6 +105,21 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
 
   const sessionId = z.string().min(1).describe("Id of the session, from session_create");
 
+  /** Why an action did not work, with its code when the API gave one. */
+  const why = (r: ActionResult | undefined) => (r?.code ? `${r.code}: ${r.error ?? "the action failed"}` : (r?.error ?? "the action failed"));
+
+  /**
+   * What an action found, after its line: the value of `evaluate`, the data of `extract`, the numbered elements of
+   * `elements` and the tabs of `tabs` (the line alone says "Ran the expression"). The other actions say all they have to say.
+   */
+  const shown = (r: ActionResult): string => {
+    const v = r.value as { elements?: string; data?: unknown; tabs?: unknown } | undefined;
+    if (v === undefined || v === null) return "";
+    const body = r.action === "evaluate" ? (typeof v === "string" ? v : JSON.stringify(v)) : r.action === "extract" ? JSON.stringify(v.data) : r.action === "elements" ? (v.elements ?? "") : r.action === "tabs" ? JSON.stringify(v.tabs) : "";
+    if (!body) return "";
+    return `\n${body.length > ACTION_VALUE_CHARS ? `${body.slice(0, ACTION_VALUE_CHARS)}\n[… cut at ${ACTION_VALUE_CHARS} characters]` : body}`;
+  };
+
   // ---------- sessions ----------
 
   tool(
@@ -130,7 +127,8 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
     {
       title: "Create a session",
       description:
-        "Create a new isolated session (Chrome browser + optional bash shell + shared /workspace disk). Returns its sessionId: pass it to every other session tool. " +
+        "Create a new isolated session: a Chrome browser, a bash shell or both, and a shared /workspace disk. Returns its sessionId: pass it to every other session tool. " +
+        "browser (default true) and shell (default true) choose the kind: browser: false with a shell is a shell-only session (no live view; the browser_* tools are refused). " +
         "Optionally browse through a proxy: proxyType residential (home IPs) or datacenter, with proxyCountry (two letters) and, for residential, proxyCity. " +
         "blockAds: refuse ad and tracker sites (faster, less clutter). cookieBanners: \"reject\" (default) answers cookie consent banners with Reject all, \"off\" leaves them. " +
         "profile: the id of a saved browser profile to start from (its cookies and logins); persistProfile saves what the session signs in to back into it when it ends." +
@@ -143,6 +141,7 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
       omitInDirectory: ["credentials"],
     },
     {
+      browser: z.boolean().optional().describe("Give the session a browser (default true). false needs a shell: a shell-only session"),
       shell: z.boolean().optional(),
       timeout: z.number().optional(),
       proxyType: z.enum(["residential", "datacenter"]).optional(),
@@ -160,22 +159,57 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
           ? { type: "residential" as const, country: a.proxyCountry, city: a.proxyCity }
           : { type: "datacenter" as const, country: a.proxyCountry }
         : undefined;
-      const settings: BrowserSettings = { blockAds: a.blockAds, cookieBanners: a.cookieBanners };
       if (a.persistProfile && !a.profile) throw new Error("persistProfile needs a profile id");
       const profile = a.profile ? { id: a.profile, persist: a.persistProfile ?? false } : undefined;
       const credentials = full && a.credentials?.length ? a.credentials : undefined;
       const timeout = a.timeout ?? (await defaultTimeout());
-      const params = { browser: true, shell: a.shell ?? true, timeout, proxy, profile, credentials, ...settings };
+      const browser = a.browser ?? true;
+      const params = { browser, shell: a.shell ?? true, timeout, proxy, profile, credentials, blockAds: a.blockAds, cookieBanners: a.cookieBanners };
       let s: Session;
       try {
         s = await client.sessions.create(params);
       } catch (err) {
-        // No shells here (a plan without them, or a local API that doesn't allow them) and none was asked for: a
-        // browser-only session still serves every browser, file and fetch tool.
-        if (a.shell !== undefined || !/shell/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        // No shells here (a plan without them, or a local API that doesn't allow them), none was asked for and the session
+        // has a browser: a browser-only session still serves every browser, file and web tool. A shell-only session has
+        // nothing to fall back to: the real error is the answer.
+        if (a.shell !== undefined || !browser || !/shell/i.test(err instanceof Error ? err.message : String(err))) throw err;
         s = await client.sessions.create({ ...params, shell: false, credentials: undefined });
       }
       return text(JSON.stringify({ sessionId: s.id, ...live(s), workspace: s.workspacePath, shell: s.data.shell }, null, 2));
+    },
+  );
+
+  tool(
+    "session_list",
+    {
+      title: "List sessions",
+      description:
+        "List the project's sessions, newest first: id, status (RUNNING, STOPPED, DELETED, ERROR), kind (browser, shell or combined) and when it was created. " +
+        "Use it to find a session id again. Filter by status (several joined with commas, e.g. RUNNING,STOPPED), kind, or q (an id prefix or text in the session's userMetadata); " +
+        "limit (1 to 100, default 20); when there are more, the last line gives the after to pass to read the next ones. Stopped sessions are listed too: session_resume brings one back.",
+      effect: "read",
+      web: false,
+    },
+    {
+      status: z.string().optional().describe("Only these statuses, comma-separated: RUNNING, STOPPED, DELETED, ERROR"),
+      kind: z.enum(["browser", "shell", "combined"]).optional(),
+      q: z.string().optional().describe("An id prefix, or text in the session's userMetadata"),
+      limit: z.number().int().min(1).max(100).optional().describe("How many sessions, 1 to 100 (default 20)"),
+      after: z.string().optional().describe("The cursor from the last line of the previous answer"),
+    },
+    async (a) => {
+      const statuses = a.status
+        ?.split(",")
+        .map((v) => v.trim().toUpperCase())
+        .filter(Boolean) as SessionStatus[] | undefined;
+      const bad = statuses?.find((v) => !["RUNNING", "STOPPED", "DELETED", "ERROR"].includes(v));
+      if (bad) throw new Error(`status ${bad} is not one of RUNNING, STOPPED, DELETED, ERROR`);
+      const page = await client.sessions.list({ status: statuses?.length ? statuses : undefined, kind: a.kind, q: a.q, limit: a.limit ?? 20, after: a.after });
+      const kind = (s: Session) => (s.data.shell ? (s.data.browser === false ? "shell" : "combined") : "browser");
+      const rows = page.data.map((s) => `${s.id}  ${String(s.status).padEnd(7)}  ${kind(s).padEnd(8)}  ${s.data.createdAt}`);
+      if (!rows.length) return text("No sessions.");
+      if (page.next) rows.push(`More sessions: call session_list again with after "${page.next}".`);
+      return text(rows.join("\n"));
     },
   );
 
@@ -228,14 +262,386 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
     },
   );
 
+  // ---------- browser (a session with a browser: the API answers browser_disabled to a shell-only one) ----------
+
+  tool("browser_navigate", { title: "Open a URL", description: "Open a URL in the session's browser.", effect: "change", web: true }, { sessionId, url: z.string() }, async (a) => {
+    const v = await (await machine(a.sessionId)).goto(a.url);
+    return text(`Loaded ${v.url} (HTTP ${v.status ?? "?"}) — ${v.title}`);
+  });
+
   tool(
-    "session_move",
-    { title: "Move a session to a fresh machine", description: "Move the session to a fresh machine, keeping tabs, logins, form values and files.", effect: "change", web: false },
-    { sessionId },
+    "browser_act",
+    {
+      title: "Do steps in the browser",
+      description:
+        "Do one or more steps on the session's browser page, in order, and stop at the first one that fails. Each step is a sentence in plain English (\"click the Sign in link\", \"scroll to the pricing table\") " +
+        "or an exact action object such as {\"action\": \"click\", \"selector\": \"text=Sign in\"}, {\"action\": \"hover\", \"selector\": \"text=Products\"}, {\"action\": \"goto\", \"url\": \"https://example.com\"}, " +
+        "{\"action\": \"scroll\", \"deltaY\": 600}, {\"action\": \"evaluate\", \"expression\": \"document.title\"}, {\"action\": \"click\", \"selector\": \"#file\", \"button\": \"right\"} or {\"action\": \"drag\", \"from\": {\"x\": 10, \"y\": 10}, \"to\": {\"x\": 200, \"y\": 10}}. " +
+        "A plain-English step is carried out by a model (like a step of an agent run: it is billed as one and needs a plan that includes plain-English steps); an action object uses no model. " +
+        "Use it to do several things in one call, or when saying what to click is easier than finding its selector. Coordinates are CSS pixels of the viewport. Returns one line per step saying what happened; an evaluate step also gives the value it returned, extract the data, elements the page's numbered elements.",
+      effect: "change",
+      web: true,
+    },
+    {
+      sessionId,
+      actions: z
+        .array(z.union([z.string().min(1).max(2000), z.looseObject({ action: z.string() })]))
+        .min(1)
+        .max(100)
+        .describe("The steps, 1 to 100: a plain-English sentence, or an action object with an `action` field"),
+    },
+    async (a) => {
+      if (!full) {
+        // The directory setting never takes saved credentials: not as a step's credentials, not as a type or login action.
+        const named = a.actions.find((x) => typeof x !== "string" && (x.action === "login" || "credential" in x || "credentials" in x));
+        if (named) throw new Error("that action is not available on this server");
+      }
+      const s = await machine(a.sessionId);
+      const results = await s.actions(a.actions as ActionItem[]);
+      const lines = results.map((r, i) => `${i + 1}. ${r.ok ? `${r.text ?? `${r.action} done`}${shown(r)}` : `Failed: ${why(r)}`}`);
+      const ok = results.every((r) => r.ok);
+      return { ...text(lines.join("\n") || "(no steps)"), ...(ok ? {} : { isError: true }) };
+    },
+  );
+
+  tool(
+    "browser_click",
+    {
+      title: "Click an element",
+      description:
+        "Click an element (Playwright selector such as `text=Sign in` or `#submit`) or at page coordinates x and y. For a right or double click, or a click with a key held, use browser_act with a click action.",
+      effect: "change",
+      web: true,
+    },
+    { sessionId, selector: z.string().optional(), x: z.number().optional(), y: z.number().optional() },
+    async (a) => {
+      if (a.selector === undefined && (a.x === undefined || a.y === undefined)) return fail("give a selector, or x and y");
+      const [r] = await (await machine(a.sessionId)).actions({ action: "click", selector: a.selector, x: a.x, y: a.y });
+      return r?.ok ? text("Clicked.") : fail(why(r));
+    },
+  );
+
+  tool(
+    "browser_type",
+    {
+      title: "Type text",
+      description: full
+        ? "Type text, optionally into the element matched by selector. To type a saved password or secret, give credential (a name from credentials_list) instead of text: " +
+          "the platform types it without you seeing it. For a password also give field: username, password or otp (the current 2FA code, when credentials_list says it has 2FA; with codeSource push or url it waits for the code the user's system sends). " +
+          "A password goes only into the field selector names, and only on the sites it was saved for. Never ask the user to paste a password into the chat."
+        : "Type text, optionally into the element matched by selector.",
+      effect: "change",
+      web: true,
+      omitInDirectory: ["credential", "field"],
+    },
+    {
+      sessionId,
+      text: full ? z.string().optional() : z.string(),
+      selector: z.string().optional(),
+      credential: z.string().optional().describe("Name of a saved credential (credentials_list) to type instead of text"),
+      field: z.enum(["username", "password", "otp"]).optional().describe("Which part of a password credential to type"),
+    },
+    async (a) => {
+      const credential = full ? a.credential : undefined;
+      const field = full ? a.field : undefined;
+      if (credential !== undefined && a.text !== undefined) return fail("give text or credential, not both");
+      if (credential === undefined && a.text === undefined) return fail(full ? "give the text to type, or a credential to type" : "give the text to type");
+      if (credential === undefined && field !== undefined) return fail("field is only for credential");
+      const s = await machine(a.sessionId);
+      const [r] = await s.actions(credential !== undefined ? { action: "type", credential, field, selector: a.selector } : { action: "type", text: a.text!, selector: a.selector });
+      if (r?.ok) return text(credential !== undefined ? (r.text ?? `Typed ${credential}.`) : "Typed.");
+      return fail(why(r));
+    },
+  );
+
+  tool(
+    "browser_press",
+    {
+      title: "Press keys",
+      description:
+        "Press keys on the session's browser page: one key (Enter, Escape, ArrowDown, Tab), a combination held together with + (Control+A, Shift+Tab, Meta+C), or several combinations one after the other separated by spaces (\"ctrl+a Delete\"). " +
+        "Key names are Playwright's; common spellings such as ctrl, cmd and Return work too, and a capital letter is typed with Shift. The machines run Linux: select-all is Control+A (ControlOrMeta+A works everywhere). " +
+        "The keys go to the page, never to the machine's desktop.",
+      effect: "change",
+      web: true,
+    },
+    { sessionId, keys: z.string().min(1).describe("The keys: Enter, Control+A, or several separated by spaces") },
+    async (a) => {
+      const [r] = await (await machine(a.sessionId)).actions({ action: "key", keys: a.keys });
+      return r?.ok ? text(r.text ?? `Pressed ${a.keys}`) : fail(why(r));
+    },
+  );
+
+  tool("browser_read", { title: "Read the page", description: "Read the current page as markdown or plain text.", effect: "read", web: true }, { sessionId, format: z.enum(["markdown", "text"]).optional() }, async (a) => {
+    const v = await (await machine(a.sessionId, false)).content(a.format ?? "markdown");
+    return text(`# ${v.title}\n${v.url}\n\n${v.content}`);
+  });
+
+  tool("browser_screenshot", { title: "Screenshot the page", description: "Screenshot the current tab.", effect: "read", web: true }, { sessionId, fullPage: z.boolean().optional() }, async (a) => {
+    const shot = await (await machine(a.sessionId, false)).screenshot({ format: "jpeg", quality: 60, fullPage: a.fullPage });
+    return { content: [{ type: "image" as const, data: shot.data, mimeType: shot.mimeType }] };
+  });
+
+  if (full) {
+    tool(
+      "browser_login",
+      {
+        title: "Sign in with a saved credential",
+        description:
+          "Sign the session's browser in with a saved password credential (a name from credentials_list), in one call: a short run in the session types the credential on its own sites only, " +
+          "and you never see the password or any 2FA code or sign-in link. Give url to start from the site's sign-in page (it must be one of the credential's sites; default: the first). " +
+          "A credential whose codeSource is push or url waits for the code or link the user's system sends, up to its timeout: the call can take a few minutes, so tell the user a code is needed. " +
+          "Returns the page it ends on. Needs a session with a browser.",
+        effect: "change",
+        web: true,
+      },
+      {
+        sessionId,
+        credential: z.string().describe("Name of a saved password credential (credentials_list)"),
+        url: z.string().optional().describe("The sign-in page, on one of the credential's sites"),
+      },
+      async (a) => {
+        const s = await machine(a.sessionId);
+        try {
+          const v = await s.login(a.credential, a.url !== undefined ? { url: a.url } : {});
+          return text(`Signed in with ${a.credential}: ${v.title || "(no title)"} (${v.url}).`);
+        } catch (err) {
+          if (err instanceof CredentialLoginFailedError) return fail(`${err.code}: ${err.message}${err.runId ? ` (run ${err.runId})` : ""}`);
+          throw err;
+        }
+      },
+    );
+  }
+
+  tool(
+    "browser_computer",
+    {
+      title: "Run a computer-use action",
+      description:
+        "Run ONE computer-use action as a model's computer tool gives it, in Anthropic's shape ({action:'left_click', coordinate:[x, y]}) or OpenAI's ({type:'click', x, y, button}), " +
+        "then see the screen. Coordinates are pixels of the screenshot; with maxWidth the screenshot is scaled down and coordinates are scaled back.",
+      effect: "change",
+      web: true,
+    },
+    { sessionId, action: z.record(z.string(), z.unknown()).describe("The provider's action object"), maxWidth: z.number().int().min(100).max(3840).optional(), screenshot: z.boolean().optional() },
     async (a) => {
       const s = await machine(a.sessionId);
-      return text(`Moved in ${(await s.move()).totalMs} ms.`);
+      const r = await s.computer(a.action as unknown as ComputerAction, { maxWidth: a.maxWidth, screenshot: a.screenshot });
+      const summary = `${r.ok ? r.text : `Failed: ${r.error}`}\nPointer: (${r.cursor.x}, ${r.cursor.y}) · scale ${r.scale} · ${r.title} — ${r.url}`;
+      return {
+        ...(r.ok ? {} : { isError: true }),
+        content: [{ type: "text" as const, text: summary }, ...(r.screenshot ? [{ type: "image" as const, data: r.screenshot, mimeType: r.mimeType ?? "image/png" }] : [])],
+      };
     },
+  );
+
+  // ---------- shell and files ----------
+
+  tool(
+    "shell_exec",
+    {
+      title: "Run a shell command",
+      description:
+        "Run a bash command in the session's persistent shell (cd and export persist). Working directory starts at the workspace; browser downloads are in ./downloads. Needs a session with a shell. " +
+        "For a job longer than timeoutMs, start it in the background (`nohup … > job.log 2>&1 &`) and read job.log later with files_read.",
+      effect: "destroy",
+      web: true,
+    },
+    { sessionId, command: z.string(), timeoutMs: z.number().int().min(100).max(3_600_000).optional() },
+    async (a) => {
+      const r = await (await machine(a.sessionId)).exec(a.command, { timeoutMs: a.timeoutMs ?? 120_000 });
+      const out = [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)";
+      return text(`${out}\n[exit code ${r.exitCode ?? "timeout"}]`);
+    },
+  );
+
+  // The two read-only file tools work on a stopped session too: the API serves its saved workspace without starting a machine.
+  tool(
+    "files_list",
+    { title: "List files", description: "List files in the session workspace. A stopped session's saved files are listed without resuming it.", effect: "read", web: false },
+    { sessionId, path: z.string().optional() },
+    async (a) => {
+      const r = await client.sessions.files.list(a.sessionId, a.path ?? ".");
+      return text(r.entries.map((e) => `${e.type === "dir" ? "d" : "-"} ${String(e.size).padStart(10)}  ${e.name}`).join("\n") || "(empty)");
+    },
+  );
+
+  tool(
+    "files_read",
+    { title: "Read a file", description: "Read a text file from the session workspace. A stopped session's saved files are read without resuming it.", effect: "read", web: false },
+    { sessionId, path: z.string() },
+    async (a) => text(await client.sessions.files.readText(a.sessionId, a.path)),
+  );
+
+  tool(
+    "files_write",
+    { title: "Write a file", description: "Write a text file into the session workspace. An existing file at that path is overwritten.", effect: "destroy", web: false },
+    { sessionId, path: z.string(), content: z.string() },
+    async (a) => {
+      const r = await (await machine(a.sessionId)).files.write(a.path, a.content);
+      return text(`Wrote ${r.size} bytes to ${r.path}.`);
+    },
+  );
+
+  tool(
+    "files_delete",
+    { title: "Delete a file", description: "Delete a file from the session workspace. It cannot be brought back.", effect: "destroy", web: false },
+    { sessionId, path: z.string() },
+    async (a) => {
+      await (await machine(a.sessionId)).files.delete(a.path);
+      return text(`Deleted ${a.path}.`);
+    },
+  );
+
+  // ---------- the web: no session needed ----------
+
+  tool(
+    "web_fetch",
+    {
+      title: "Fetch a web page",
+      description: "Fetch a web page through a real browser and return markdown, HTML or text (no session needed). blockAds: refuse ad and tracker sites while loading it.",
+      effect: "read",
+      web: true,
+    },
+    { url: z.string(), format: z.enum(["markdown", "html", "text"]).optional(), blockAds: z.boolean().optional() },
+    async (a) => {
+      const r = await client.fetch(a.url, { format: a.format ?? "markdown", blockAds: a.blockAds });
+      return text(`# ${r.title}\n${r.finalUrl} (HTTP ${r.status})\n\n${r.content}`);
+    },
+  );
+
+  tool(
+    "web_search",
+    {
+      title: "Search the web",
+      description:
+        "Search the web (no session needed). Returns titles, URLs and snippets of the top results; open one with browser_navigate or web_fetch. " +
+        "Set fetch to also get the top 1 to 5 pages as Markdown in the same call. Each search counts against the plan's monthly searches (the same search within an hour is free).",
+      effect: "read",
+      web: true,
+    },
+    {
+      query: z.string().min(1).max(400),
+      limit: z.number().int().min(1).max(20).optional().describe("Results, 1 to 20 (default 10)"),
+      country: z.string().optional().describe("Two-letter country code the results come from, e.g. DE"),
+      language: z.string().optional().describe("Language of the results, e.g. de"),
+      recency: z.enum(["day", "week", "month", "year"]).optional(),
+      fetch: z.number().int().min(0).max(5).optional().describe("Also return the top N pages as Markdown (0 to 5)"),
+    },
+    async (a) => {
+      const r = await client.search({ query: a.query, limit: a.limit, country: a.country, language: a.language, recency: a.recency, fetch: a.fetch || undefined });
+      if (!r.results.length) return text(`No results for "${r.query}".`);
+      const lines = r.results.map((x, i) => {
+        const head = `${i + 1}. ${x.title}\n   ${x.url}${x.publishedAt ? ` (${x.publishedAt.slice(0, 10)})` : ""}\n   ${x.snippet}`;
+        if (x.error) return `${head}\n   [could not load the page: ${x.error.code}: ${x.error.message}]`;
+        return x.content ? `${head}\n\n${x.content}\n` : head;
+      });
+      return text(`Search results for "${r.query}"${r.cached ? " (cached)" : ""}:\n\n${lines.join("\n\n")}`);
+    },
+  );
+
+  tool(
+    "web_screenshot",
+    {
+      title: "Screenshot a web page",
+      description: "Take a screenshot of a web page in a fresh browser (no session needed). fullPage captures the whole page instead of the first screen. To see the page a session is on, use browser_screenshot.",
+      effect: "read",
+      web: true,
+    },
+    { url: z.string(), fullPage: z.boolean().optional() },
+    async (a) => {
+      const bytes = await client.screenshot(a.url, { format: "jpeg", quality: 60, fullPage: a.fullPage });
+      return { content: [{ type: "image" as const, data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" }] };
+    },
+  );
+
+  tool(
+    "web_extract",
+    {
+      title: "Extract data from pages",
+      description:
+        "Read up to 10 pages in a real browser and return the data asked for as JSON (no session needed): give url or urls, and a prompt saying what to collect " +
+        "or a JSON Schema for exact fields. A page that does not show a value gives null, never a guess. Uses a model, billed like other model calls. Public pages only.",
+      effect: "read",
+      web: true,
+    },
+    {
+      url: z.string().optional(),
+      urls: z.array(z.string()).min(1).max(10).optional(),
+      prompt: z.string().max(4000).optional().describe("What to collect, in words"),
+      schema: z.record(z.string(), z.unknown()).optional().describe("A JSON Schema the result must match"),
+    },
+    async (a) => {
+      if (!a.url && !a.urls?.length) throw new Error("give url or urls");
+      if (!a.prompt && !a.schema) throw new Error("give a prompt or a schema");
+      const r = await client.extract({ url: a.url, urls: a.urls, prompt: a.prompt, schema: a.schema });
+      const pages = r.pages.map((pg) => `- ${pg.finalUrl ?? pg.url}: ${pg.error ? `not read (${pg.error.code}: ${pg.error.message})` : `HTTP ${pg.status}`}`);
+      return text(`${JSON.stringify(r.data, null, 2)}\n\nPages:\n${pages.join("\n")}`);
+    },
+  );
+
+  /** A crawl and one page of its pages, as text: how far it got, then each page (its content capped so many fit). */
+  async function crawlReport(id: string, after?: string): Promise<string> {
+    const job = await client.crawl.get(id, { limit: CRAWL_PAGES_PER_CALL, after });
+    const head =
+      `Crawl ${job.id} of ${job.url}: ${job.status}; ${job.pagesDone} pages read, ${job.pagesFailed} failed, ${job.skippedByRobots} skipped by robots.txt.` +
+      (job.error ? ` Error: ${job.error}` : "");
+    const pages = job.data.map((pg) => {
+      const where = `${pg.finalUrl ?? pg.url} (${pg.status === null ? "no answer" : `HTTP ${pg.status}`}, depth ${pg.depth})`;
+      if (pg.error) return `## ${pg.title ?? pg.url}\n${where}\nFailed: ${pg.error}`;
+      if (pg.captcha) return `## ${pg.title ?? pg.url}\n${where}\nThe page showed a CAPTCHA (${pg.captcha}); it was not read.`;
+      const body = pg.content ?? "";
+      return `## ${pg.title ?? pg.url}\n${where}\n\n${body.length > CRAWL_PAGE_CHARS ? `${body.slice(0, CRAWL_PAGE_CHARS)}\n[… page cut at ${CRAWL_PAGE_CHARS} characters]` : body}`;
+    });
+    const more =
+      job.next ? `More pages: call web_crawl_get with crawlId "${job.id}" and after "${job.next}".`
+      : job.status === "running" ? `The crawl is still running: call web_crawl_get with crawlId "${job.id}"${after ? ` and after "${after}"` : ""} in a few seconds.`
+      : "That is every page.";
+    return [head, ...pages, more].join("\n\n");
+  }
+
+  tool(
+    "web_crawl_start",
+    {
+      title: "Crawl a website",
+      description:
+        "Crawl a website from a start URL (no session needed): follow its links, read each page in a real browser and return the pages as markdown, text or HTML. " +
+        "Respects robots.txt and stays on the start page's host unless sameHost is false. Waits up to waitSeconds (default 45) and returns the pages read so far; " +
+        "while it is still running, web_crawl_get gives the rest. Public pages only.",
+      effect: "change",
+      web: true,
+    },
+    {
+      url: z.string(),
+      maxPages: z.number().int().min(1).max(1000).optional().describe("Pages to read, 1 to 1000 (default 20; the plan's crawl limit applies)"),
+      maxDepth: z.number().int().min(0).max(10).optional().describe("Link depth from the start page, 0 to 10 (default 3)"),
+      include: z.array(z.string()).max(20).optional().describe("Only follow URLs that match one of these regular expressions"),
+      exclude: z.array(z.string()).max(20).optional().describe("Never follow URLs that match one of these regular expressions"),
+      sameHost: z.boolean().optional().describe("Stay on the start page's host (default true)"),
+      format: z.enum(["markdown", "text", "html"]).optional(),
+      waitSeconds: z.number().int().min(0).max(120).optional().describe("How long to wait for the crawl before answering (default 45)"),
+    },
+    async (a) => {
+      let job = await client.crawl.start({ url: a.url, maxPages: a.maxPages, maxDepth: a.maxDepth, include: a.include, exclude: a.exclude, sameHost: a.sameHost, format: a.format ?? "markdown" });
+      const until = Date.now() + (a.waitSeconds ?? 45) * 1000;
+      while (job.status === "running" && Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 2000));
+        job = await client.crawl.get(job.id, { limit: 0 });
+      }
+      return text(await crawlReport(job.id));
+    },
+  );
+
+  tool(
+    "web_crawl_get",
+    {
+      title: "Get a crawl's pages",
+      description: `The state of a crawl started with web_crawl_start and its next pages (${CRAWL_PAGES_PER_CALL} at a time; pass the after it gives to go on). It only reads.`,
+      effect: "read",
+      web: false,
+    },
+    { crawlId: z.string().min(1), after: z.string().optional() },
+    async (a) => text(await crawlReport(a.crawlId, a.after)),
   );
 
   // ---------- saved credentials (not in the directory setting) ----------
@@ -276,436 +682,7 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
         return text(JSON.stringify(rows, null, 2));
       },
     );
-
-    tool(
-      "browser_login",
-      {
-        title: "Sign in with a saved credential",
-        description:
-          "Sign the session's browser in with a saved password credential (a name from credentials_list), in one call: a short run in the session types the credential on its own sites only, " +
-          "and you never see the password or any 2FA code or sign-in link. Give url to start from the site's sign-in page (it must be one of the credential's sites; default: the first). " +
-          "A credential whose codeSource is push or url waits for the code or link the user's system sends, up to its timeout: the call can take a few minutes, so tell the user a code is needed. " +
-          "Returns the page it ends on. Needs a session with a browser.",
-        effect: "change",
-        web: true,
-      },
-      {
-        sessionId,
-        credential: z.string().describe("Name of a saved password credential (credentials_list)"),
-        url: z.string().optional().describe("The sign-in page, on one of the credential's sites"),
-      },
-      async (a) => {
-        const s = await machine(a.sessionId);
-        try {
-          const v = await s.login(a.credential, a.url !== undefined ? { url: a.url } : {});
-          return text(`Signed in with ${a.credential}: ${v.title || "(no title)"} (${v.url}).`);
-        } catch (err) {
-          if (err instanceof CredentialLoginFailedError) return fail(`${err.code}: ${err.message}${err.runId ? ` (run ${err.runId})` : ""}`);
-          throw err;
-        }
-      },
-    );
   }
-
-  // ---------- browser ----------
-
-  tool("browser_navigate", { title: "Open a URL", description: "Open a URL in the session's browser.", effect: "change", web: true }, { sessionId, url: z.string() }, async (a) => {
-    const v = await (await machine(a.sessionId)).goto(a.url);
-    return text(`Loaded ${v.url} (HTTP ${v.status ?? "?"}) — ${v.title}`);
-  });
-
-  tool(
-    "browser_click",
-    {
-      title: "Click an element",
-      description: "Click an element (Playwright selector such as `text=Sign in` or `#submit`) or at page coordinates.",
-      effect: "change",
-      web: true,
-    },
-    { sessionId, selector: z.string().optional(), x: z.number().optional(), y: z.number().optional() },
-    async (a) => {
-      const [r] = await (await machine(a.sessionId)).actions({ action: "click", selector: a.selector, x: a.x, y: a.y });
-      return r?.ok ? text("Clicked.") : fail(r?.error);
-    },
-  );
-
-  tool(
-    "browser_type",
-    {
-      title: "Type text",
-      description: full
-        ? "Type text, optionally into the element matched by selector. To type a saved password or secret, give credential (a name from credentials_list) instead of text: " +
-          "the platform types it without you seeing it. For a password also give field: username, password or otp (the current 2FA code, when credentials_list says it has 2FA; with codeSource push or url it waits for the code the user's system sends). " +
-          "A password goes only into the field selector names, and only on the sites it was saved for. Never ask the user to paste a password into the chat."
-        : "Type text, optionally into the element matched by selector.",
-      effect: "change",
-      web: true,
-      omitInDirectory: ["credential", "field"],
-    },
-    {
-      sessionId,
-      text: full ? z.string().optional() : z.string(),
-      selector: z.string().optional(),
-      credential: z.string().optional().describe("Name of a saved credential (credentials_list) to type instead of text"),
-      field: z.enum(["username", "password", "otp"]).optional().describe("Which part of a password credential to type"),
-    },
-    async (a) => {
-      const credential = full ? a.credential : undefined;
-      const field = full ? a.field : undefined;
-      if (credential !== undefined && a.text !== undefined) return fail("give text or credential, not both");
-      if (credential === undefined && a.text === undefined) return fail(full ? "give the text to type, or a credential to type" : "give the text to type");
-      if (credential === undefined && field !== undefined) return fail("field is only for credential");
-      const s = await machine(a.sessionId);
-      const [r] = await s.actions(credential !== undefined ? { action: "type", credential, field, selector: a.selector } : { action: "type", text: a.text!, selector: a.selector });
-      if (r?.ok) return text(credential !== undefined ? (r.text ?? `Typed ${credential}.`) : "Typed.");
-      return fail(r?.code ? `${r.code}: ${r.error ?? "the action failed"}` : r?.error);
-    },
-  );
-
-  tool("browser_press", { title: "Press a key", description: "Press a key, e.g. Enter or Control+A.", effect: "change", web: true }, { sessionId, key: z.string() }, async (a) => {
-    const [r] = await (await machine(a.sessionId)).actions({ action: "press", key: a.key });
-    return r?.ok ? text(`Pressed ${a.key}.`) : fail(r?.error);
-  });
-
-  // ---------- mouse and keyboard (coordinates are CSS pixels of the viewport) ----------
-  // These call the API directly: the SDK's typed action list does not have the mouse actions yet.
-
-  async function input(id: string, action: Record<string, unknown>) {
-    const s = await machine(id);
-    const { results } = await client.request<{ results: ActionResult[] }>("POST", `/v1/sessions/${s.id}/actions`, { actions: [action] });
-    const r = results[0];
-    return r?.ok ? text(r.text ?? "Done.") : fail(r?.error ?? "the action failed");
-  }
-  const point = { x: z.number().optional(), y: z.number().optional() };
-
-  tool(
-    "mouse_move",
-    {
-      title: "Move the pointer",
-      description: "Move the pointer to x/y (CSS pixels of the viewport). steps > 1 moves in a straight line through that many points (1-100), for pages that follow the pointer.",
-      effect: "change",
-      web: true,
-    },
-    { sessionId, x: z.number(), y: z.number(), steps: z.number().int().min(1).max(100).optional() },
-    (a) => input(a.sessionId, { action: "move", x: a.x, y: a.y, steps: a.steps }),
-  );
-
-  tool(
-    "mouse_click",
-    {
-      title: "Click at a point",
-      description: "Click at x/y or on a selector: button left (default), right (context menu) or middle; count 2 for a double click, 3 for a triple click.",
-      effect: "change",
-      web: true,
-    },
-    { sessionId, ...point, selector: z.string().optional(), button: z.enum(["left", "right", "middle"]).optional(), count: z.number().int().min(1).max(3).optional() },
-    (a) => input(a.sessionId, { action: "click", selector: a.selector, x: a.x, y: a.y, button: a.button, count: a.count as 1 | 2 | 3 | undefined }),
-  );
-
-  tool(
-    "mouse_drag",
-    {
-      title: "Drag with the mouse",
-      description: "Drag with the left button held: from a selector or fromX/fromY to a selector or toX/toY (e.g. a slider handle or a list item), or along path (up to 200 {x, y} points).",
-      effect: "change",
-      web: true,
-    },
-    {
-      sessionId,
-      fromSelector: z.string().optional(),
-      fromX: z.number().optional(),
-      fromY: z.number().optional(),
-      toSelector: z.string().optional(),
-      toX: z.number().optional(),
-      toY: z.number().optional(),
-      path: z.array(z.object({ x: z.number(), y: z.number() })).max(200).optional(),
-      steps: z.number().int().min(1).max(100).optional(),
-    },
-    (a) => {
-      const end = (sel?: string, x?: number, y?: number) => sel ?? (x !== undefined && y !== undefined ? { x, y } : undefined);
-      return input(a.sessionId, a.path ? { action: "drag", path: a.path, steps: a.steps } : { action: "drag", from: end(a.fromSelector, a.fromX, a.fromY), to: end(a.toSelector, a.toX, a.toY), steps: a.steps });
-    },
-  );
-
-  tool(
-    "hover",
-    { title: "Hover", description: "Move the pointer over a selector or to x/y, e.g. to open a menu that shows on hover.", effect: "change", web: true },
-    { sessionId, selector: z.string().optional(), ...point },
-    (a) => input(a.sessionId, { action: "hover", selector: a.selector, x: a.x, y: a.y }),
-  );
-
-  tool(
-    "key",
-    { title: "Press a key combination", description: "Press a key combination, e.g. Control+A, Shift+Tab, Meta+C (or one key: Enter, Escape, ArrowDown).", effect: "change", web: true },
-    { sessionId, keys: z.string() },
-    (a) => input(a.sessionId, { action: "key", keys: a.keys }),
-  );
-
-  tool(
-    "computer",
-    {
-      title: "Run a computer-use action",
-      description:
-        "Run ONE computer-use action as a model's computer tool gives it, in Anthropic's shape ({action:'left_click', coordinate:[x, y]}) or OpenAI's ({type:'click', x, y, button}), " +
-        "then see the screen. Coordinates are pixels of the screenshot; with maxWidth the screenshot is scaled down and coordinates are scaled back.",
-      effect: "change",
-      web: true,
-    },
-    { sessionId, action: z.record(z.string(), z.unknown()).describe("The provider's action object"), maxWidth: z.number().int().min(100).max(3840).optional(), screenshot: z.boolean().optional() },
-    async (a) => {
-      const s = await machine(a.sessionId);
-      const r = await client.request<{ ok: boolean; error?: string; text: string; screenshot: string | null; mimeType: string | null; scale: number; cursor: { x: number; y: number }; url: string; title: string }>(
-        "POST",
-        `/v1/sessions/${s.id}/computer`,
-        { ...a.action, maxWidth: a.maxWidth, screenshot: a.screenshot },
-      );
-      const summary = `${r.ok ? r.text : `Failed: ${r.error}`}\nPointer: (${r.cursor.x}, ${r.cursor.y}) · scale ${r.scale} · ${r.title} — ${r.url}`;
-      return {
-        ...(r.ok ? {} : { isError: true }),
-        content: [{ type: "text" as const, text: summary }, ...(r.screenshot ? [{ type: "image" as const, data: r.screenshot, mimeType: r.mimeType ?? "image/png" }] : [])],
-      };
-    },
-  );
-
-  tool("browser_screenshot", { title: "Screenshot the page", description: "Screenshot the current tab.", effect: "read", web: true }, { sessionId, fullPage: z.boolean().optional() }, async (a) => {
-    const shot = await (await machine(a.sessionId, false)).screenshot({ format: "jpeg", quality: 60, fullPage: a.fullPage });
-    return { content: [{ type: "image" as const, data: shot.data, mimeType: shot.mimeType }] };
-  });
-
-  tool("browser_read", { title: "Read the page", description: "Read the current page as markdown or plain text.", effect: "read", web: true }, { sessionId, format: z.enum(["markdown", "text"]).optional() }, async (a) => {
-    const v = await (await machine(a.sessionId, false)).content(a.format ?? "markdown");
-    return text(`# ${v.title}\n${v.url}\n\n${v.content}`);
-  });
-
-  // ---------- shell and files ----------
-
-  tool(
-    "run_command",
-    {
-      title: "Run a shell command",
-      description: "Run a bash command in the session's persistent shell (cd and export persist). Working directory starts at the workspace; browser downloads are in ./downloads.",
-      effect: "destroy",
-      web: true,
-    },
-    { sessionId, command: z.string(), timeoutMs: z.number().optional() },
-    async (a) => {
-      const r = await (await machine(a.sessionId)).exec(a.command, { timeoutMs: a.timeoutMs ?? 120_000 });
-      const out = [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)";
-      return text(`${out}\n[exit code ${r.exitCode ?? "timeout"}]`);
-    },
-  );
-
-  tool(
-    "run_playwright",
-    {
-      title: "Run Playwright code",
-      description:
-        "Run Playwright JavaScript inside the session's sandbox, next to its browser. `page`, `context`, `browser` and `env` are in scope; top-level await works; a returned value is printed. Do not call browser.close(). `step(instruction)` and `extract(instruction, schema?)` use the call's own {provider, model}, else the last `useModel(model)` / `useModel(provider, model)` in the code, else `ai`.",
-      effect: "destroy",
-      web: true,
-    },
-    {
-      sessionId,
-      code: z.string(),
-      env: z.record(z.string(), z.string()).optional(),
-      timeoutMs: z.number().optional(),
-      ai: z.object({ provider: z.enum(["anthropic", "openai", "xai", "google"]).optional(), model: z.string().optional() }).optional(),
-    },
-    async (a) => {
-      const r = await (await machine(a.sessionId)).runScript(a.code, { env: a.env, timeoutMs: a.timeoutMs ?? 120_000, ai: a.ai });
-      const out = [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)";
-      return { ...text(`${out}\n[exit code ${r.exitCode ?? "timeout"}]`), ...(r.exitCode === 0 ? {} : { isError: true }) };
-    },
-  );
-
-  tool("list_files", { title: "List files", description: "List files in the session workspace.", effect: "read", web: false }, { sessionId, path: z.string().optional() }, async (a) => {
-    const r = await (await machine(a.sessionId, false)).files.list(a.path ?? ".");
-    return text(r.entries.map((e) => `${e.type === "dir" ? "d" : "-"} ${String(e.size).padStart(10)}  ${e.name}`).join("\n") || "(empty)");
-  });
-
-  tool("read_file", { title: "Read a file", description: "Read a text file from the session workspace.", effect: "read", web: false }, { sessionId, path: z.string() }, async (a) => {
-    return text(await (await machine(a.sessionId, false)).files.readText(a.path));
-  });
-
-  tool(
-    "write_file",
-    { title: "Write a file", description: "Write a text file into the session workspace. An existing file at that path is overwritten.", effect: "destroy", web: false },
-    { sessionId, path: z.string(), content: z.string() },
-    async (a) => {
-      const r = await (await machine(a.sessionId)).files.write(a.path, a.content);
-      return text(`Wrote ${r.size} bytes to ${r.path}.`);
-    },
-  );
-
-  tool(
-    "delete_file",
-    { title: "Delete a file", description: "Delete a file from the session workspace. It cannot be brought back.", effect: "destroy", web: false },
-    { sessionId, path: z.string() },
-    async (a) => {
-      await (await machine(a.sessionId)).files.delete(a.path);
-      return text(`Deleted ${a.path}.`);
-    },
-  );
-
-  // ---------- no session needed ----------
-
-  tool(
-    "fetch_url",
-    {
-      title: "Fetch a web page",
-      description: "Fetch a web page through a real browser and return markdown, HTML or text (no session needed). blockAds: refuse ad and tracker sites while loading it.",
-      effect: "read",
-      web: true,
-    },
-    { url: z.string(), format: z.enum(["markdown", "html", "text"]).optional(), blockAds: z.boolean().optional() },
-    async (a) => {
-      const settings: BrowserSettings = { blockAds: a.blockAds };
-      const opts = { format: a.format ?? "markdown", ...settings };
-      const r = await client.fetch(a.url, opts);
-      return text(`# ${r.title}\n${r.finalUrl} (HTTP ${r.status})\n\n${r.content}`);
-    },
-  );
-
-  tool(
-    "web_search",
-    {
-      title: "Search the web",
-      description:
-        "Search the web (no session needed). Returns titles, URLs and snippets of the top results; open one with browser_navigate or fetch_url. " +
-        "Set fetch to also get the top 1 to 5 pages as Markdown in the same call. Each search counts against the plan's monthly searches (the same search within an hour is free).",
-      effect: "read",
-      web: true,
-    },
-    {
-      query: z.string().min(1).max(400),
-      limit: z.number().int().min(1).max(20).optional().describe("Results, 1 to 20 (default 10)"),
-      country: z.string().optional().describe("Two-letter country code the results come from, e.g. DE"),
-      language: z.string().optional().describe("Language of the results, e.g. de"),
-      recency: z.enum(["day", "week", "month", "year"]).optional(),
-      fetch: z.number().int().min(0).max(5).optional().describe("Also return the top N pages as Markdown (0 to 5)"),
-    },
-    async (a) => {
-      const r = await client.request<SearchAnswer>("POST", "/v1/search", {
-        query: a.query,
-        limit: a.limit,
-        country: a.country,
-        language: a.language,
-        recency: a.recency,
-        fetch: a.fetch || undefined,
-      });
-      if (!r.results.length) return text(`No results for "${r.query}".`);
-      const lines = r.results.map((x, i) => {
-        const head = `${i + 1}. ${x.title}\n   ${x.url}${x.publishedAt ? ` (${x.publishedAt.slice(0, 10)})` : ""}\n   ${x.snippet}`;
-        if (x.error) return `${head}\n   [could not load the page: ${x.error.code}: ${x.error.message}]`;
-        return x.content ? `${head}\n\n${x.content}\n` : head;
-      });
-      return text(`Search results for "${r.query}"${r.cached ? " (cached)" : ""}:\n\n${lines.join("\n\n")}`);
-    },
-  );
-
-  /** A crawl and one page of its pages, as text: how far it got, then each page (its content capped so many fit). */
-  async function crawlReport(id: string, after?: string): Promise<string> {
-    const job = await client.crawl.get(id, { limit: CRAWL_PAGES_PER_CALL, after });
-    const head =
-      `Crawl ${job.id} of ${job.url}: ${job.status}; ${job.pagesDone} pages read, ${job.pagesFailed} failed, ${job.skippedByRobots} skipped by robots.txt.` +
-      (job.error ? ` Error: ${job.error}` : "");
-    const pages = job.data.map((pg) => {
-      const where = `${pg.finalUrl ?? pg.url} (${pg.status === null ? "no answer" : `HTTP ${pg.status}`}, depth ${pg.depth})`;
-      if (pg.error) return `## ${pg.title ?? pg.url}\n${where}\nFailed: ${pg.error}`;
-      if (pg.captcha) return `## ${pg.title ?? pg.url}\n${where}\nThe page showed a CAPTCHA (${pg.captcha}); it was not read.`;
-      const body = pg.content ?? "";
-      return `## ${pg.title ?? pg.url}\n${where}\n\n${body.length > CRAWL_PAGE_CHARS ? `${body.slice(0, CRAWL_PAGE_CHARS)}\n[… page cut at ${CRAWL_PAGE_CHARS} characters]` : body}`;
-    });
-    const more =
-      job.next ? `More pages: call crawl_results with crawlId "${job.id}" and after "${job.next}".`
-      : job.status === "running" ? `The crawl is still running: call crawl_results with crawlId "${job.id}"${after ? ` and after "${after}"` : ""} in a few seconds.`
-      : "That is every page.";
-    return [head, ...pages, more].join("\n\n");
-  }
-
-  tool(
-    "crawl_site",
-    {
-      title: "Crawl a website",
-      description:
-        "Crawl a website from a start URL (no session needed): follow its links, read each page in a real browser and return the pages as markdown, text or HTML. " +
-        "Respects robots.txt and stays on the start page's host unless sameHost is false. Waits up to waitSeconds (default 45) and returns the pages read so far; " +
-        "while it is still running, crawl_results gives the rest. Public pages only.",
-      effect: "read",
-      web: true,
-    },
-    {
-      url: z.string(),
-      maxPages: z.number().int().min(1).max(200).optional().describe("Pages to read, 1 to 200 (default 20)"),
-      maxDepth: z.number().int().min(0).max(10).optional().describe("Link depth from the start page, 0 to 10 (default 3)"),
-      include: z.array(z.string()).max(20).optional().describe("Only follow URLs that match one of these regular expressions"),
-      exclude: z.array(z.string()).max(20).optional().describe("Never follow URLs that match one of these regular expressions"),
-      sameHost: z.boolean().optional().describe("Stay on the start page's host (default true)"),
-      format: z.enum(["markdown", "text", "html"]).optional(),
-      waitSeconds: z.number().int().min(0).max(120).optional().describe("How long to wait for the crawl before answering (default 45)"),
-    },
-    async (a) => {
-      let job = await client.crawl.start({ url: a.url, maxPages: a.maxPages, maxDepth: a.maxDepth, include: a.include, exclude: a.exclude, sameHost: a.sameHost, format: a.format ?? "markdown" });
-      const until = Date.now() + (a.waitSeconds ?? 45) * 1000;
-      while (job.status === "running" && Date.now() < until) {
-        await new Promise((r) => setTimeout(r, 2000));
-        job = await client.crawl.get(job.id, { limit: 0 });
-      }
-      return text(await crawlReport(job.id));
-    },
-  );
-
-  tool(
-    "crawl_results",
-    {
-      title: "Get a crawl's pages",
-      description: `The state of a crawl started with crawl_site and its next pages (${CRAWL_PAGES_PER_CALL} at a time; pass the after it gives to go on).`,
-      effect: "read",
-      web: false,
-    },
-    { crawlId: z.string().min(1), after: z.string().optional() },
-    async (a) => text(await crawlReport(a.crawlId, a.after)),
-  );
-
-  tool(
-    "extract_data",
-    {
-      title: "Extract data from pages",
-      description:
-        "Read up to 10 pages in a real browser and return the data asked for as JSON (no session needed): give url or urls, and a prompt saying what to collect " +
-        "or a JSON Schema for exact fields. A page that does not show a value gives null, never a guess. Uses a model, billed like other model calls. Public pages only.",
-      effect: "read",
-      web: true,
-    },
-    {
-      url: z.string().optional(),
-      urls: z.array(z.string()).min(1).max(10).optional(),
-      prompt: z.string().max(4000).optional().describe("What to collect, in words"),
-      schema: z.record(z.string(), z.unknown()).optional().describe("A JSON Schema the result must match"),
-    },
-    async (a) => {
-      if (!a.url && !a.urls?.length) throw new Error("give url or urls");
-      if (!a.prompt && !a.schema) throw new Error("give a prompt or a schema");
-      const r = await client.extract({ url: a.url, urls: a.urls, prompt: a.prompt, schema: a.schema });
-      const pages = r.pages.map((pg) => `- ${pg.finalUrl ?? pg.url}: ${pg.error ? `not read (${pg.error.code}: ${pg.error.message})` : `HTTP ${pg.status}`}`);
-      return text(`${JSON.stringify(r.data, null, 2)}\n\nPages:\n${pages.join("\n")}`);
-    },
-  );
-
-  tool(
-    "screenshot_url",
-    {
-      title: "Screenshot a web page",
-      description: "Take a screenshot of a web page in a fresh browser (no session needed). fullPage captures the whole page instead of the first screen.",
-      effect: "read",
-      web: true,
-    },
-    { url: z.string(), fullPage: z.boolean().optional() },
-    async (a) => {
-      const bytes = await client.screenshot(a.url, { format: "jpeg", quality: 60, fullPage: a.fullPage });
-      return { content: [{ type: "image" as const, data: Buffer.from(bytes).toString("base64"), mimeType: "image/jpeg" }] };
-    },
-  );
 
   return server;
 }
