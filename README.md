@@ -50,7 +50,7 @@ hints), so a client can decide what to ask you about. There are 26 tools:
 | Sessions | `session_create` (a browser, a shell or both; optionally from a saved browser `profile`, and with `credentials` exported into the shell), `session_list` (find a session again), `session_stop` (saves the session as it is and stops billing), `session_resume` (brings a stopped session back as it was), `session_delete` (deletes it and what it saved, for good) |
 | Browser | `browser_navigate`, `browser_act` (one or more steps in plain English or as exact actions: hover, scroll, drag, right and double clicks…), `browser_click` (a selector or x/y), `browser_type` (text, or a saved credential), `browser_press` (keys: `Enter`, `Control+A`, `ctrl+a Delete`), `browser_read` (Markdown or text), `browser_screenshot`, `browser_login` (sign in with a saved password), `browser_computer` (screenshot-driven computer use) |
 | Shell | `shell_exec` (bash in the session) |
-| Files | `files_list`, `files_read`, `files_write`, `files_delete` (the session's workspace, its disk) |
+| Files | `files_list`, `files_read`, `files_write`, `files_delete` (the session's workspace, its disk; `files_delete` also removes a folder with everything in it) |
 | Web | `web_fetch` (a page through a real browser), `web_search` (with the top pages as Markdown), `web_screenshot` (a quick screenshot), `web_extract` (JSON from up to 10 pages, from a prompt or a JSON Schema), `web_crawl_start` and `web_crawl_get` (a whole site or section, robots.txt respected); none needs a session |
 | Credentials | `credentials_list` (names, types, sites and a password's code source for the saved passwords and secrets, never their values) |
 
@@ -85,7 +85,8 @@ it.** It is a guard against showing a credential by accident, not a boundary: co
 (an `evaluate` action in `browser_act`, a command in `shell_exec`) can still read a field and print it, for example reversed or in base64. Use a
 password only in sessions whose pages and scripts you trust, and save it with the narrowest sites. `session_create` can also start from a saved browser `profile` (cookies and logins from an
 earlier sign-in; `persistProfile` saves new ones back) and export `credentials` into the session's shell as environment
-variables, for those credentials that allow it. No tool creates or changes a credential, so a password never passes
+variables, for those `credentials_list` marks `exportable` (scope `shell` or `all`, or `shell: true`); others are refused. With a
+shell, the password a profile signs in with is exported too when it is exportable. No tool creates or changes a credential, so a password never passes
 through the chat: add them yourself, outside the conversation.
 
 Sessions are billed while they run: stop them with `session_stop` when the work is done, or let them stop at their time

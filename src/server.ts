@@ -36,6 +36,9 @@ const INSTRUCTIONS =
   "web_fetch, web_search, web_screenshot, web_extract and the web_crawl tools need no session. Call session_stop when you are done: billing stops and session_resume brings the session back as it was.";
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s.length > TEXT_LIMIT ? `${s.slice(0, TEXT_LIMIT)}\n[… truncated]` : s }] });
+/** The API refused a shell because there are none here: the plan has no shell sessions, or a local API does not run them. */
+const noShells = (err: unknown): err is BoxlineError =>
+  err instanceof BoxlineError && (err.code === "shell_unavailable" || (err.code === "feature_not_in_plan" && /shell/i.test(err.message)));
 const fail = (err: unknown) => ({
   isError: true,
   content: [{ type: "text" as const, text: err instanceof BoxlineError ? `${err.code}: ${err.message}` : String(err) }],
@@ -131,9 +134,11 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
         "browser (default true) and shell (default true) choose the kind: browser: false with a shell is a shell-only session (no live view; the browser_* tools are refused). " +
         "Optionally browse through a proxy: proxyType residential (home IPs) or datacenter, with proxyCountry (two letters) and, for residential, proxyCity. " +
         "blockAds: refuse ad and tracker sites (faster, less clutter). cookieBanners: \"reject\" (default) answers cookie consent banners with Reject all, \"off\" leaves them. " +
-        "profile: the id of a saved browser profile to start from (its cookies and logins); persistProfile saves what the session signs in to back into it when it ends." +
+        "profile: the id of a saved browser profile to start from (its cookies and logins); persistProfile saves what the session signs in to back into it when it ends. " +
+        "timeout: seconds the session may run before it stops (at least 60; default the plan's longest, up to 1800); billing runs until it stops." +
         (full
-          ? " credentials: names of saved credentials (see credentials_list) to export into the shell as environment variables, only those whose scope allows the shell; needs a shell. " +
+          ? " credentials: names of saved credentials (see credentials_list) to export into the shell as environment variables; only those credentials_list marks exportable (scope shell or all, or shell: true), others are refused; needs a shell. " +
+            "With a shell, the password a profile signs in with is exported too when it is exportable, even if not listed. " +
             "To sign in on a page, do not export anything: use browser_type with a credential."
           : ""),
       effect: "change",
@@ -143,7 +148,7 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
     {
       browser: z.boolean().optional().describe("Give the session a browser (default true). false needs a shell: a shell-only session"),
       shell: z.boolean().optional(),
-      timeout: z.number().optional(),
+      timeout: z.number().optional().describe("Seconds the session may run before it stops (at least 60; default the plan's longest, up to 1800)"),
       proxyType: z.enum(["residential", "datacenter"]).optional(),
       proxyCountry: z.string().length(2).optional(),
       proxyCity: z.string().optional(),
@@ -169,11 +174,13 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
       try {
         s = await client.sessions.create(params);
       } catch (err) {
-        // No shells here (a plan without them, or a local API that doesn't allow them), none was asked for and the session
-        // has a browser: a browser-only session still serves every browser, file and web tool. A shell-only session has
-        // nothing to fall back to: the real error is the answer.
-        if (a.shell !== undefined || !browser || !/shell/i.test(err instanceof Error ? err.message : String(err))) throw err;
-        s = await client.sessions.create({ ...params, shell: false, credentials: undefined });
+        // No shells here (a plan without them, or a local API that doesn't run them), none was asked for and the session
+        // has a browser: a browser-only session still serves every browser, file and web tool. A shell-only session, or one
+        // asked to export credentials, has nothing to fall back to, and any other refusal (a credential not for shells, a
+        // setting) is not about shells being available: the real error is the answer.
+        if (a.shell !== undefined || !browser || credentials || !noShells(err)) throw err;
+        s = await client.sessions.create({ ...params, shell: false });
+        return text(JSON.stringify({ sessionId: s.id, ...live(s), workspace: s.workspacePath, shell: false, noShell: `${err.code}: ${err.message}` }, null, 2));
       }
       return text(JSON.stringify({ sessionId: s.id, ...live(s), workspace: s.workspacePath, shell: s.data.shell }, null, 2));
     },
@@ -485,7 +492,7 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
 
   tool(
     "files_delete",
-    { title: "Delete a file", description: "Delete a file from the session workspace. It cannot be brought back.", effect: "destroy", web: false },
+    { title: "Delete a file or folder", description: "Delete a file, or a folder with everything in it, from the session workspace. It cannot be brought back. A path that does not exist is not an error.", effect: "destroy", web: false },
     { sessionId, path: z.string() },
     async (a) => {
       await (await machine(a.sessionId)).files.delete(a.path);
@@ -659,13 +666,14 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
         title: "List saved credentials",
         description:
           "List the project's saved credentials (passwords and secrets): name, type, the sites each may be typed on, and for a password which fields browser_type can type and where its 2FA codes come from (codeSource: totp, push, url, or null for no 2FA). " +
-          "Never shows a value. Use a name with browser_type's credential, in browser_login, or in session_create's credentials. Credentials are added by the user in the Boxline console, the CLI or an SDK, not here.",
+          "Never shows a value. browserType: whether browser_type may type it (scope agent or all). exportable: whether session_create's credentials may put it in the shell (scope shell or all, or shell: true, which also lets the AI put it into bash commands). " +
+          "Use a name with browser_type's credential, a password's name in browser_login (a secret cannot sign in), or an exportable name in session_create's credentials. Credentials are added by the user in the Boxline console, the CLI or an SDK, not here.",
         effect: "read",
         web: false,
       },
       {},
       async () => {
-        const rows: { name: string; type: string; sites: string[] | "any"; scope: string; fields?: string[]; codeSource?: string | null; browserType: boolean }[] = [];
+        const rows: { name: string; type: string; sites: string[] | "any"; scope: string; shell: boolean; fields?: string[]; codeSource?: string | null; browserType: boolean; exportable: boolean }[] = [];
         for await (const c of client.credentials.list({ limit: 200 })) {
           const codeSource = c.type === "password" ? (c.codeSource ?? (c.hasTotp ? "totp" : null)) : null;
           rows.push({
@@ -673,9 +681,12 @@ export function createServer(client: Boxline, opts: ServerOptions = {}): McpServ
             type: c.type,
             sites: c.origins?.length ? c.origins : "any",
             scope: c.scope,
+            shell: c.shell,
             ...(c.type === "password" ? { fields: ["username", "password", ...(codeSource ? ["otp"] : [])], codeSource } : {}),
             // Scope "shell" is not for the AI: browser_type would be refused.
             browserType: c.scope !== "shell",
+            // What the API exports into a shell: scope "shell" or "all", or shell: true (the value is in the shell anyway).
+            exportable: c.shell || c.scope !== "agent",
           });
         }
         if (!rows.length) return text("No credentials saved. Ask the user to add one in the Boxline console.");

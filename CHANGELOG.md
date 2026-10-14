@@ -2,6 +2,18 @@
 
 All notable changes to `@boxline/mcp`.
 
+## Unreleased
+
+### Fixed
+
+- `session_create` no longer hides a refused credential: it creates a browser-only session instead only when there are no
+  shells here (the plan has none, or a local API does not run them), never when `credentials` are named or for another
+  refusal such as `credential_not_for_shell`, and its answer then says why (`noShell`).
+- `credentials_list` shows each credential's `shell` flag and `exportable` (what `session_create`'s `credentials`
+  accept: scope `shell` or `all`, or `shell: true`), and no longer suggests a secret for `browser_login`.
+- Descriptions: `session_create` documents `timeout` (seconds) and that a profile's exportable password goes into the
+  shell too; `files_delete` also deletes folders.
+
 ## 3.0.0 (2026-10-07)
 
 The tool set was redesigned: 26 tools with names that say what they are (`session_*`, `browser_*`, `shell_*`, `files_*`, `web_*`), a
