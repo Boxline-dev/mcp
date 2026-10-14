@@ -2,15 +2,24 @@
 
 All notable changes to `@boxline/mcp`.
 
-## Unreleased
+## 3.1.0 (2026-10-14)
+
+`session_create` tells the truth about a refused credential, and `credentials_list` says which credentials a shell can
+take. Built on the Node SDK 3.2 (`@boxline/sdk` `^3.2.0`).
+
+### Added
+
+- `credentials_list` shows each credential's `shell` flag and `exportable` (what `session_create`'s `credentials`
+  accept: scope `shell` or `all`, or `shell: true`).
+- `session_create`'s answer has `noShell` (the API's reason) when it made a browser-only session because there are no
+  shells here.
 
 ### Fixed
 
 - `session_create` no longer hides a refused credential: it creates a browser-only session instead only when there are no
   shells here (the plan has none, or a local API does not run them), never when `credentials` are named or for another
-  refusal such as `credential_not_for_shell`, and its answer then says why (`noShell`).
-- `credentials_list` shows each credential's `shell` flag and `exportable` (what `session_create`'s `credentials`
-  accept: scope `shell` or `all`, or `shell: true`), and no longer suggests a secret for `browser_login`.
+  refusal such as `credential_not_for_shell`.
+- `credentials_list` no longer suggests a secret for `browser_login`.
 - Descriptions: `session_create` documents `timeout` (seconds) and that a profile's exportable password goes into the
   shell too; `files_delete` also deletes folders.
 
